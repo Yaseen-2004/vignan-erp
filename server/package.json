@@ -1,0 +1,42 @@
+{
+  "name": "@vignan/server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "node --watch-path=./src src/index.js",
+    "start": "node src/index.js",
+    "migrate": "node src/db/migrate.js",
+    "seed": "node src/db/seed.js",
+    "reset": "node src/db/migrate.js --fresh && node src/db/seed.js",
+    "test": "node tests/api.test.js",
+    "test:integration": "node tests/integration.test.js",
+    "test:all": "node tests/api.test.js && node tests/integration.test.js",
+    "db:import": "node src/db/import-sqlite.js",
+    "db:pgschema": "node src/db/to-postgres.mjs",
+    "test:schema": "node tests/schema.test.js",
+    "push:keys": "node src/db/push-keys.mjs"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.2",
+    "express-rate-limit": "^7.5.0",
+    "helmet": "^8.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "pdfkit": "^0.15.2",
+    "pg": "^8.23.0",
+    "web-push": "^3.6.7",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "acorn": "^8.18.0",
+    "acorn-walk": "^8.3.5"
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "name": "vignan-erp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vignan Educational Institutions — School ERP Portal",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "setup": "npm run db:migrate && npm run db:seed",
+    "db:migrate": "npm run migrate -w server",
+    "db:seed": "npm run seed -w server",
+    "db:reset": "npm run reset -w server",
+    "dev": "concurrently -n API,WEB -c cyan,magenta \"npm run dev -w server\" \"npm run dev -w web\"",
+    "build": "npm run build -w web",
+    "start": "npm run start -w server",
+    "test": "npm run test:schema && npm run test:ui && npm run test:api && npm run test:integration",
+    "test:ui": "npm run test -w web",
+    "test:api": "node server/tests/api.test.js",
+    "test:integration": "node server/tests/integration.test.js",
+    "test:schema": "npm run test:schema -w server"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  }
+}
