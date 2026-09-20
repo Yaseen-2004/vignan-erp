@@ -52,10 +52,22 @@ const loginSchema = z.object({
   remember: z.boolean().optional(),
 });
 
+/**
+ * The session cookie.
+ *
+ * `lax` is right while the portal and the API share an origin: the cookie is
+ * sent on ordinary navigation and withheld from other sites' requests.
+ *
+ * Hosting the portal separately — the site on a CDN, the API elsewhere — makes
+ * every request cross-site, and a `lax` cookie is then simply not sent. Signing
+ * in appears to work and the session evaporates on the next page load. That
+ * deployment needs `none`, which browsers only honour on a secure connection,
+ * so `secure` is forced rather than left to be forgotten.
+ */
 const refreshCookie = {
   httpOnly: true,
-  sameSite: 'lax',
-  secure: env.isProd,
+  sameSite: env.cookieSameSite,
+  secure: env.isProd || env.cookieSameSite === 'none',
   path: '/api/auth',
 };
 

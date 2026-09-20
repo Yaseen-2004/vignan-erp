@@ -1,0 +1,23 @@
+{
+  // Cloudflare deployment for the portal — the React application only.
+  //
+  // The API is not here. It is an Express server that writes uploaded files to
+  // disk and talks to PostgreSQL; Workers has no filesystem, so the API runs on
+  // a Node host and this site is told where to find it through VITE_API_URL at
+  // build time.
+  //
+  //   Build command       npm run build -w web
+  //   Build output        web/dist
+  //   Deploy command      npx wrangler deploy
+  //   Root directory      web
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "vignan-erp",
+  "compatibility_date": "2026-09-20",
+  "assets": {
+    "directory": "./dist",
+    // The portal is a single page application: /admin/students is a route it
+    // resolves itself, not a file on disk. Without this, every deep link and
+    // every refresh away from the root would return 404.
+    "not_found_handling": "single-page-application"
+  }
+}

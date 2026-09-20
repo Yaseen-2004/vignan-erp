@@ -47,6 +47,12 @@ export const env = {
   vapidPrivateKey: process.env.VAPID_PRIVATE_KEY || '',
   vapidSubject: process.env.VAPID_SUBJECT || 'mailto:office@vignan.edu',
 
+  // 'lax' while the portal and API share an origin; 'none' when they do not,
+  // which also requires https. See the refresh cookie in routes/auth.js.
+  cookieSameSite: ['lax', 'none', 'strict'].includes(process.env.COOKIE_SAMESITE)
+    ? process.env.COOKIE_SAMESITE
+    : 'lax',
+
   jwtSecret: required('JWT_SECRET', devSecret()),
   jwtRefreshSecret: required('JWT_REFRESH_SECRET', devSecret() + 'r'),
   accessTokenTtl: process.env.ACCESS_TOKEN_TTL || '30m',

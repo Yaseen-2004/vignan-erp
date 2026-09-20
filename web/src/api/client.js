@@ -5,7 +5,35 @@
  * httpOnly cookie), and transparently refreshes an expired session once
  * before surfacing an error.
  */
-const BASE = '/api';
+/**
+ * Where the API is.
+ *
+ * Empty — the default — means "same origin as this page", which is how the
+ * portal runs in development and whenever both are served together. Set
+ * VITE_API_URL at build time to the API's address when the two are deployed
+ * separately, e.g. https://erp-api.example.com
+ *
+ * Note that a split deployment also needs the API to send its session cookie
+ * cross-site (COOKIE_SAMESITE=none) and to name this site in CORS_ORIGINS.
+ * Neither is guessable from here, which is why both are settings rather than
+ * inference.
+ */
+const ORIGIN = String(import.meta.env?.VITE_API_URL || '').replace(/\/+$/, '');
+const BASE = `${ORIGIN}/api`;
+
+/**
+ * The full URL of something the API stored — a pupil's photograph, a document,
+ * a course material.
+ *
+ * The server records these as paths like `/uploads/photos/x.jpg`, which are
+ * relative to the API, not to this page. On one origin the distinction does not
+ * arise; on two it is the difference between a photograph and a broken image.
+ */
+export function assetUrl(path) {
+  if (!path) return path;
+  if (/^(https?:|data:|blob:)/i.test(path)) return path;  // already absolute
+  return `${ORIGIN}${path.startsWith('/') ? '' : '/'}${path}`;
+}
 
 let accessToken = null;
 let onUnauthorized = null;

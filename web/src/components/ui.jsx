@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { assetUrl } from '../api/client.js';
 import { Icon } from './Icon.jsx';
 
 /* ------------------------------------------------------------- buttons */
@@ -287,7 +288,7 @@ export function Avatar({ name, src, size = '', className = '' }) {
     .join('');
   return (
     <span className={`avatar ${size} ${className}`}>
-      {src ? <img src={src} alt={name || ''} loading="lazy" /> : initials}
+      {src ? <img src={assetUrl(src)} alt={name || ''} loading="lazy" /> : initials}
     </span>
   );
 }

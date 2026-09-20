@@ -9,6 +9,7 @@
 import { Link } from 'react-router-dom';
 import { Avatar, Badge, formatCurrency, formatDate, formatDateTime, fileSize } from './components/ui.jsx';
 import { Icon } from './components/Icon.jsx';
+import { assetUrl } from './api/client.js';
 
 /* ------------------------------------------------------------ helpers */
 /** Class options labelled with their department, so "Class 8" is unambiguous. */
@@ -1446,7 +1447,7 @@ export const documents = {
       <Badge tone={row.verified ? 'success' : 'warning'} dot={false}>{row.verified ? 'Verified' : 'Pending'}</Badge>
     ) },
     { key: 'file', label: '', render: (row) => (
-      <a href={row.file_path} target="_blank" rel="noreferrer" className="btn btn-ghost btn-sm">
+      <a href={assetUrl(row.file_path)} target="_blank" rel="noreferrer" className="btn btn-ghost btn-sm">
         <Icon name="download" size={14} />
       </a>
     ) },
@@ -1501,7 +1502,7 @@ export const materialsConfig = {
       label: '',
       render: (row) =>
         row.file_path ? (
-          <a href={row.file_path} target="_blank" rel="noreferrer" className="btn btn-ghost btn-sm">
+          <a href={assetUrl(row.file_path)} target="_blank" rel="noreferrer" className="btn btn-ghost btn-sm">
             <Icon name="download" size={14} />
           </a>
         ) : row.external_url ? (

@@ -181,7 +181,56 @@ and checks the result, so the translation is verified without a cloud database t
 Every institutional table carries `campus_id`, so additional Vignan campuses can be onboarded
 without redesigning anything. The seed ships two campuses and three academic years.
 
+## Deploying
+
+The portal and the API are deployed separately, because they need different
+things. The portal is static files and belongs on a CDN; the API is a Node
+server that writes uploaded files to disk and holds connections to PostgreSQL,
+and belongs on a host that provides both.
+
+### The portal — Cloudflare
+
+Point Cloudflare at this repository with:
+
+| Setting | Value |
+| --- | --- |
+| Root directory | `web` |
+| Build command | `npm run build -w web` |
+| Build output | `web/dist` |
+| Deploy command | `npx wrangler deploy` |
+
+`web/wrangler.jsonc` does the rest. The root directory matters: this is an npm
+workspace, and Wrangler run at the top cannot tell which of `server` and `web`
+it is meant to deploy — that is what "application detection logic has been run
+in the root of a workspace" means.
+
+Set one build variable: `VITE_API_URL`, the address of the API, without a
+trailing slash. Leave it unset only when the API is served from the same origin.
+
+### The API — any Node host
+
+Render, Railway and Fly.io all work and all have a free tier; so does a plain
+VPS. Start command `npm start`, and set in the environment:
+
+    DATABASE_URL       the PostgreSQL connection string
+    JWT_SECRET         generated, see .env.example
+    JWT_REFRESH_SECRET generated, a different one
+    CORS_ORIGINS       the portal's address, e.g. https://vignan-erp.pages.dev
+    COOKIE_SAMESITE    none
+    VAPID_*            from `npm run push:keys -w server`, for notifications
+
+`COOKIE_SAMESITE=none` is the one easily missed. With the portal on another
+host every request between them is cross-site, and a `lax` cookie is not sent
+cross-site — so signing in appears to work and the session is gone on the next
+page load. It requires https, which both hosts provide.
+
+Uploaded files stay on the API host's disk. That is why the API needs a host
+with persistent storage, and why it will not run on Cloudflare Workers as it
+stands.
+
 ### Device notifications
+
+
 
 Notifications reach the phone or desktop, not only the bell in the corner. A parent
 is told their child was marked absent while the portal is closed; a teacher hears a
