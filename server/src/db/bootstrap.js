@@ -16,8 +16,8 @@
  *
  *   ADMIN_USERNAME   defaults to `admin`
  *   ADMIN_PASSWORD   required — there is no default, by design
+ *   ADMIN_EMAIL      required — where a password reset goes
  *   ADMIN_NAME       the person's name, for the top of the screen
- *   ADMIN_EMAIL      where a password reset would go
  *   SCHOOL_NAME      defaults to the application name
  *   SCHOOL_CODE      defaults to MAIN
  *
@@ -44,6 +44,9 @@ const required = (name) => {
 
 const username = process.env.ADMIN_USERNAME || 'admin';
 const password = required('ADMIN_PASSWORD');
+// Required by the schema, and it is where a password reset would go — an
+// administrator locked out with no address on file has no way back in.
+const email = required('ADMIN_EMAIL');
 
 /*
  * The demo password is published in this repository and in the README. Someone
@@ -98,7 +101,7 @@ const userId = await insert('users', {
   campus_id: campus.id,
   role_id: adminRole.id,
   username,
-  email: process.env.ADMIN_EMAIL || null,
+  email,
   password_hash: await hashPassword(password),
   full_name: process.env.ADMIN_NAME || 'Administrator',
   status: 'ACTIVE',

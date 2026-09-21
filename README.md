@@ -260,7 +260,32 @@ in the root of a workspace" means.
 Set one build variable: `VITE_API_URL`, the address of the API, without a
 trailing slash. Leave it unset only when the API is served from the same origin.
 
-### The API — any Node host
+### The API — Render
+
+`server/` carries its own manifest and lockfile, so it installs and runs
+without the rest of the repository. `render.yaml` describes the service; import
+it as a Blueprint, or create a Web Service by hand with:
+
+| Setting | Value |
+| --- | --- |
+| Root directory | `server` |
+| Build command | `npm ci --omit=dev` |
+| Start command | `npm start` |
+| Health check | `/api/health` |
+
+Then, in the dashboard, the values `render.yaml` deliberately leaves out — they
+do not belong in a public file. `npm run secrets -w server` generates the token
+secrets; `npm run preflight -w server` says what is still missing.
+
+Set `DATABASE_URL` before the first deploy. Without it the server refuses to
+start rather than keeping the school's records on a disk that the next release
+replaces — which is what it used to do, silently, on any host it had not been
+told about.
+
+The free plan sleeps after inactivity and takes around thirty seconds to wake.
+That is usually acceptable for a school; a paid plan removes it.
+
+### The API — any other Node host
 
 Render, Railway and Fly.io all work and all have a free tier; so does a plain
 VPS. Start command `npm start`, and set in the environment:

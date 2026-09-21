@@ -83,21 +83,40 @@ if (usingCloud) {
   pool.on('error', (error) => {
     console.error('· database pool error:', error.message);
   });
-} else if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+} else if (process.env.NODE_ENV === 'production'
+  || process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.RENDER) {
   /*
-   * The local database keeps its files on disk, and a serverless host has no
-   * disk worth the name — what there is vanishes when the function finishes,
-   * and much of it is read-only. Failing here, plainly, is far better than
-   * starting up and appearing to work while every enrolment and every mark is
-   * written to something about to be thrown away.
+   * The local database keeps its files beside the server, and a host does not
+   * keep them: a container's filesystem is replaced at the next deploy, and on
+   * a serverless one it goes when the function returns.
+   *
+   * This used to name the hosts it knew about, which meant every host it had
+   * not heard of — Render among them — fell through to the local database and
+   * appeared to work. Asking whether this is production is the right question;
+   * the rest are kept for the case where NODE_ENV was not set.
+   *
+   * Failing here is far better than starting up, demonstrating nicely, and
+   * turning out weeks later to have written every enrolment and every mark to
+   * something that was thrown away.
    */
   throw new Error(
-    'DATABASE_URL is not set. A serverless deployment has no disk to keep a '
-    + 'local database on, so a managed PostgreSQL connection string is required. '
-    + 'See .env.example.'
+    'DATABASE_URL is not set. A deployed server has nowhere durable to keep a '
+    + 'local database (a container filesystem is replaced at the next '
+    + 'release), so a managed PostgreSQL connection string is required here. '
+    + 'See .env.example, and `npm run preflight` for what else is missing.'
   );
 } else {
-  const { PGlite } = await import('@electric-sql/pglite');
+  let PGlite;
+  try {
+    ({ PGlite } = await import('@electric-sql/pglite'));
+  } catch {
+    // It is a development dependency, so a production install leaves it out.
+    // Reaching here means no DATABASE_URL on a machine that installed that way.
+    throw new Error(
+      'No database is configured. Set DATABASE_URL to a PostgreSQL connection '
+      + 'string, or install development dependencies to use the local database.'
+    );
+  }
   const dir = env.databaseDir;
   fs.mkdirSync(path.dirname(dir), { recursive: true });
   claimDataDir(dir);

@@ -1,0 +1,58 @@
+# Deploying the backend on Render.
+#
+# The API is its own service. `server/` carries its own manifest and lockfile,
+# so Render installs and runs it without the rest of the repository — the
+# portal is built and hosted separately, and the two meet over HTTP.
+#
+# Import this file with Render's Blueprints, or set the same values by hand in
+# a new Web Service. Either way, set the secrets below in the dashboard: they
+# are deliberately not in this file, which is public.
+services:
+  - type: web
+    name: vignan-erp-api
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+
+      # Required. Without it the server refuses to start rather than keeping
+      # the school's records on a disk that the next deploy replaces.
+      - key: DATABASE_URL
+        sync: false
+
+      # Required. Generate with: npm run secrets -w server
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_REFRESH_SECRET
+        sync: false
+
+      # The portal's address, so the browser is allowed to call this API, and
+      # so the session cookie survives the two being on different hosts.
+      - key: CORS_ORIGINS
+        sync: false
+      - key: COOKIE_SAMESITE
+        value: none
+
+      # Uploaded files. Without these they go to the container's disk, which is
+      # replaced at every deploy — the records survive, the files do not.
+      - key: S3_BUCKET
+        sync: false
+      - key: S3_ENDPOINT
+        sync: false
+      - key: S3_ACCESS_KEY_ID
+        sync: false
+      - key: S3_SECRET_ACCESS_KEY
+        sync: false
+
+      # Notifications. Generate with: npm run push:keys -w server
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_SUBJECT
+        sync: false
