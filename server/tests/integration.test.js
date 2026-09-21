@@ -279,7 +279,11 @@ const run = async () => {
         body: {
           exam_subject_id: sheet.exam_subject_id,
           submit: false,
-          records: [{ student_id: pupilId2, marks_obtained: original ?? 0 }],
+          // Exactly what was found, including nothing at all. A pupil with no
+          // mark and a pupil who scored nought are different people, and
+          // writing 0 for the first turns this suite into something that
+          // quietly marks pupils down.
+          records: [{ student_id: pupilId2, marks_obtained: original }],
         },
       });
       check('only the Admin can reopen an approved mark',
@@ -290,7 +294,7 @@ const run = async () => {
             body: {
               exam_subject_id: sheet.exam_subject_id,
               submit: false,
-              records: [{ student_id: pupilId2, marks_obtained: original ?? 0 }],
+              records: [{ student_id: pupilId2, marks_obtained: original }],
             },
           })).status === 403,
         'the office approves marks, it does not write them');
@@ -342,7 +346,7 @@ const run = async () => {
         body: {
           exam_subject_id: sheet.exam_subject_id,
           submit: true,
-          records: [{ student_id: pupilId2, marks_obtained: original ?? 0 }],
+          records: [{ student_id: pupilId2, marks_obtained: original }],
         },
       });
       if (wasApproved) {

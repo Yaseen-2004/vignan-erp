@@ -81,17 +81,33 @@ async function refreshSession() {
 
 async function request(path, { method = 'GET', body, headers = {}, signal, retry = true, raw = false } = {}) {
   const isFormData = body instanceof FormData;
-  const response = await fetch(`${BASE}${path}`, {
-    method,
-    credentials: 'include',
-    signal,
-    headers: {
-      ...(body && !isFormData ? { 'Content-Type': 'application/json' } : {}),
-      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
-      ...headers,
-    },
-    body: isFormData ? body : body ? JSON.stringify(body) : undefined,
-  });
+  let response;
+  try {
+    response = await fetch(`${BASE}${path}`, {
+      method,
+      credentials: 'include',
+      signal,
+      headers: {
+        ...(body && !isFormData ? { 'Content-Type': 'application/json' } : {}),
+        ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+        ...headers,
+      },
+      body: isFormData ? body : body ? JSON.stringify(body) : undefined,
+    });
+  } catch (cause) {
+    // A cancelled request is the caller's own doing; leave it alone.
+    if (cause?.name === 'AbortError') throw cause;
+    // Everything else here is the request never arriving: no network, the
+    // server not running, or the browser refusing it because the server did
+    // not allow this site. The browser deliberately hides which, so the
+    // message covers them without pretending to know.
+    throw new ApiError(
+      `The portal cannot reach the school server at ${ORIGIN || 'this address'}. `
+      + 'Check that the server is running and that it allows this site.',
+      0,
+      'UNREACHABLE'
+    );
+  }
 
   // A 401 on an authenticated call means the access token aged out.
   if (response.status === 401 && retry && !path.startsWith('/auth/')) {
@@ -118,15 +134,43 @@ async function request(path, { method = 'GET', body, headers = {}, signal, retry
 
   if (!response.ok) {
     const error = payload?.error;
-    throw new ApiError(
-      error?.message || `Request failed (${response.status})`,
-      response.status,
-      error?.code,
-      error?.details
-    );
+    if (error?.message) {
+      throw new ApiError(error.message, response.status, error.code, error.details);
+    }
+    // No JSON error body means the response did not come from this API at all.
+    throw new ApiError(offApi(response), response.status, 'UNREACHABLE');
   }
 
   return payload;
+}
+
+/**
+ * Explain a reply that did not come from the API.
+ *
+ * Every real failure here arrives as JSON with a message written for the
+ * person reading it. Anything else means the request reached something that is
+ * not this API — most often a site deployed without one behind it, where a
+ * static host answers a sign-in POST with 405 because it serves GET and
+ * nothing else. "Request failed (405)" tells nobody anything; this says what
+ * actually happened and what to look at.
+ */
+function offApi(response) {
+  const where = ORIGIN || 'the same address as this page';
+  switch (response.status) {
+    case 404:
+    case 405:
+    case 501:
+      return `The portal cannot reach the school server. It is set to use ${where}, `
+        + 'which is answering as a plain web site rather than the ERP server. '
+        + 'If this site was just deployed, the server may not be running yet.';
+    case 502:
+    case 503:
+    case 504:
+      return 'The school server is not responding. It may be starting up — '
+        + 'wait a moment and try again.';
+    default:
+      return `The school server replied unexpectedly (${response.status}).`;
+  }
 }
 
 export const api = {
