@@ -1,0 +1,27 @@
+{
+  // Deploying from the repository root.
+  //
+  // This is an npm workspace holding two applications, and `wrangler deploy`
+  // run here cannot tell which one is meant — that is the "application
+  // detection logic has been run in the root of a workspace" error. Detection
+  // only runs when wrangler finds no configuration, so this file settles it:
+  // the portal is what gets deployed, and the API is not deployable to Workers
+  // (it writes uploaded files to disk and holds PostgreSQL connections, neither
+  // of which Workers provides). See README for where the API belongs.
+  //
+  // Building here too, so a bare `npx wrangler deploy` works without any build
+  // command configured in the dashboard.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "vignan-erp",
+  "compatibility_date": "2026-09-20",
+  "build": {
+    "command": "npm run build -w web"
+  },
+  "assets": {
+    "directory": "./web/dist",
+    // The portal is a single-page application: /admin/students is a route it
+    // resolves itself, not a file on disk. Without this every deep link and
+    // every refresh away from the root would 404.
+    "not_found_handling": "single-page-application"
+  }
+}
