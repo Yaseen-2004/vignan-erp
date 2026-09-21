@@ -188,12 +188,28 @@ things. The portal is static files and belongs on a CDN; the API is a Node
 server that writes uploaded files to disk and holds connections to PostgreSQL,
 and belongs on a host that provides both.
 
-### The portal — Vercel
+### Both halves on Vercel
 
 Import the repository and Vercel reads `vercel.json`: it builds the web
-workspace and publishes `web/dist`. Nothing needs setting in the dashboard
-except one build variable, `VITE_API_URL`, the address of the API without a
-trailing slash.
+workspace, publishes `web/dist`, and runs the Express API as a function under
+`api/`. Because both are served from one origin, `VITE_API_URL`,
+`CORS_ORIGINS` and `COOKIE_SAMESITE` are all unnecessary — they exist for
+hosting the two apart.
+
+Set in the project's environment:
+
+    DATABASE_URL       a managed PostgreSQL connection string — required, as
+                       there is no disk here to keep a local database on. Use
+                       the provider's *pooled* string: a serverless deployment
+                       may run many instances, each holding connections.
+    JWT_SECRET         generated, see .env.example
+    JWT_REFRESH_SECRET generated, a different one
+    S3_BUCKET etc.     required for uploads, which otherwise go to a filesystem
+                       that is discarded when the function finishes
+    VAPID_*            from `npm run push:keys -w server`, for notifications
+
+The API refuses to start without `DATABASE_URL` rather than appearing to work
+while every enrolment is written to a disk about to be thrown away.
 
 Vercel looks for a directory named `public` unless told otherwise, which is
 why the output directory is named explicitly — a build that succeeds and then

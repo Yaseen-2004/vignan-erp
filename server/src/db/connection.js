@@ -83,6 +83,19 @@ if (usingCloud) {
   pool.on('error', (error) => {
     console.error('· database pool error:', error.message);
   });
+} else if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+  /*
+   * The local database keeps its files on disk, and a serverless host has no
+   * disk worth the name — what there is vanishes when the function finishes,
+   * and much of it is read-only. Failing here, plainly, is far better than
+   * starting up and appearing to work while every enrolment and every mark is
+   * written to something about to be thrown away.
+   */
+  throw new Error(
+    'DATABASE_URL is not set. A serverless deployment has no disk to keep a '
+    + 'local database on, so a managed PostgreSQL connection string is required. '
+    + 'See .env.example.'
+  );
 } else {
   const { PGlite } = await import('@electric-sql/pglite');
   const dir = env.databaseDir;

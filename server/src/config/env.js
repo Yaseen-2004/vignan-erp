@@ -4,7 +4,10 @@ import { fileURLToPath } from 'node:url';
 import crypto from 'node:crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-export const SERVER_ROOT = path.resolve(__dirname, '..', '..');
+export // Vercel, AWS Lambda and the like set one of these; a plain server sets neither.
+const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+const SERVER_ROOT = path.resolve(__dirname, '..', '..');
 
 function required(name, fallback) {
   const value = process.env[name];
@@ -33,7 +36,11 @@ export const env = {
   // development and the test suites run against.
   databaseUrl: process.env.DATABASE_URL || '',
   databaseDir: process.env.DATABASE_DIR || path.join(SERVER_ROOT, 'data', 'pg'),
-  databasePoolMax: Number(process.env.DATABASE_POOL_MAX || 10),
+  // One instance of a serverless function serves one request at a time, but
+  // there may be a great many instances. Ten connections each is how a managed
+  // database runs out of them; the pooled connection string a provider offers
+  // is what handles the fan-in.
+  databasePoolMax: Number(process.env.DATABASE_POOL_MAX || (IS_SERVERLESS ? 1 : 10)),
 
   // Retained so the one-off importer can find a pre-migration SQLite file.
   databaseFile: process.env.DATABASE_FILE || path.join(SERVER_ROOT, 'data', 'vignan_erp.db'),

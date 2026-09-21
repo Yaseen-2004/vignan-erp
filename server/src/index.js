@@ -37,6 +37,7 @@ import assignmentRoutes from './routes/assignments.js';
 import storageRoutes from './routes/storage.js';
 import { describe, isCloud as isCloudDatabase } from './db/connection.js';
 import { Readable } from 'node:stream';
+import { pathToFileURL } from 'node:url';
 import { read as readUpload, describe as describeFiles, usingObjectStorage } from './lib/files.js';
 
 const app = express();
@@ -156,20 +157,33 @@ if (fs.existsSync(clientDist)) {
 app.use(notFoundHandler);
 app.use(errorHandler);
 
-const server = app.listen(env.port, () => {
-  console.log(`\n  ${env.appName}`);
-  console.log(`  API      http://localhost:${env.port}/api`);
-  console.log(`  Health   http://localhost:${env.port}/api/health`);
-  console.log(`  Database ${describe()}`);
-  console.log(`  Files    ${describeFiles()}`);
-  console.log(`  Mode     ${env.nodeEnv}\n`);
-});
+/*
+ * Listening is for running as a server.
+ *
+ * On a serverless host this same app is imported and handed one request at a
+ * time; there is no port to take and nothing to shut down, and binding one
+ * would fail. So the socket is opened only when this file is what was run.
+ */
+const runDirectly = process.argv[1]
+  && pathToFileURL(process.argv[1]).href === import.meta.url;
 
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, () => {
-    console.log(`\n${signal} received — shutting down.`);
-    server.close(() => process.exit(0));
+if (runDirectly) {
+  const server = app.listen(env.port, () => {
+    console.log(`\n  ${env.appName}`);
+    console.log(`  API      http://localhost:${env.port}/api`);
+    console.log(`  Health   http://localhost:${env.port}/api/health`);
+    console.log(`  Database ${describe()}`);
+    console.log(`  Files    ${describeFiles()}`);
+    console.log(`  Mode     ${env.nodeEnv}\n`);
   });
+
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => {
+      console.log(`\n${signal} received — shutting down.`);
+      server.close(() => process.exit(0));
+    });
+  }
+
 }
 
 export default app;
