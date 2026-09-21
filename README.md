@@ -188,9 +188,25 @@ things. The portal is static files and belongs on a CDN; the API is a Node
 server that writes uploaded files to disk and holds connections to PostgreSQL,
 and belongs on a host that provides both.
 
+### The portal — Vercel
+
+Import the repository and Vercel reads `vercel.json`: it builds the web
+workspace and publishes `web/dist`. Nothing needs setting in the dashboard
+except one build variable, `VITE_API_URL`, the address of the API without a
+trailing slash.
+
+Vercel looks for a directory named `public` unless told otherwise, which is
+why the output directory is named explicitly — a build that succeeds and then
+reports "No Output Directory named public" has found this file missing.
+
+`/api` and `/uploads` are deliberately left out of the single-page rewrite.
+They belong to the API, and answering them with the portal's HTML would turn a
+clear failure into a baffling one: the portal would receive a web page where it
+expected data.
+
 ### The portal — Cloudflare
 
-Point Cloudflare at this repository with:
+Alternatively, point Cloudflare at this repository with:
 
 | Setting | Value |
 | --- | --- |

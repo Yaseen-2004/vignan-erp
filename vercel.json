@@ -1,0 +1,25 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+
+  "//": [
+    "Deploying the portal — the React application only.",
+    "",
+    "The API is not here. It is an Express server holding PostgreSQL connections",
+    "and serving uploaded files; it runs on a Node host, and this site is told",
+    "where to find it with VITE_API_URL at build time. See README.",
+    "",
+    "This repository is an npm workspace, so the build runs the web workspace and",
+    "the output is web/dist rather than the `public` Vercel looks for by default."
+  ],
+
+  "buildCommand": "npm run build -w web",
+  "outputDirectory": "web/dist",
+
+  "rewrites": [
+    {
+      "//": "The portal resolves its own routes: /admin/students is not a file on disk, so anything that is not a real file returns index.html. /api and /uploads are deliberately excluded — they belong to the API, and answering them with the application's HTML would turn a clear failure into a baffling one, since the portal would try to read a web page as data.",
+      "source": "/((?!api/|uploads/).*)",
+      "destination": "/index.html"
+    }
+  ]
+}
