@@ -18,6 +18,7 @@
     "db:import": "node src/db/import-sqlite.js",
     "db:pgschema": "node src/db/to-postgres.mjs",
     "test:schema": "node tests/schema.test.js",
+    "test:mongo": "node tests/mongo.test.js",
     "push:keys": "node src/db/push-keys.mjs"
   },
   "dependencies": {
@@ -31,6 +32,7 @@
     "express-rate-limit": "^7.5.0",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
+    "mongoose": "^9.10.1",
     "multer": "^2.4.0",
     "pdfkit": "^0.15.2",
     "pg": "^8.23.0",
@@ -40,6 +42,7 @@
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.8",
     "acorn": "^8.18.0",
-    "acorn-walk": "^8.3.5"
+    "acorn-walk": "^8.3.5",
+    "mongodb-memory-server": "^11.3.0"
   }
 }

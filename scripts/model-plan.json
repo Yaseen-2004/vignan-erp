@@ -1,0 +1,4358 @@
+[
+ {
+  "table": "campuses",
+  "model": "Campus",
+  "fields": [
+   {
+    "col": "code",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "address",
+    "type": "String"
+   },
+   {
+    "col": "city",
+    "type": "String"
+   },
+   {
+    "col": "state",
+    "type": "String"
+   },
+   {
+    "col": "pincode",
+    "type": "String"
+   },
+   {
+    "col": "phone",
+    "type": "String"
+   },
+   {
+    "col": "email",
+    "type": "String"
+   },
+   {
+    "col": "principal",
+    "type": "String"
+   },
+   {
+    "col": "logo",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "roles",
+  "model": "Role",
+  "fields": [
+   {
+    "col": "code",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "level",
+    "type": "Number",
+    "required": true,
+    "default": 50
+   },
+   {
+    "col": "is_system",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "permissions",
+  "model": "Permission",
+  "fields": [
+   {
+    "col": "code",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "module",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "action",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "description",
+    "type": "String"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "role_permissions",
+  "model": "RolePermission",
+  "fields": [
+   {
+    "col": "role_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Role"
+   },
+   {
+    "col": "permission_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Permission"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (role_id, permission_id)"
+  ]
+ },
+ {
+  "table": "users",
+  "model": "User",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "ref": "Campus"
+   },
+   {
+    "col": "role_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Role"
+   },
+   {
+    "col": "username",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "email",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "password_hash",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "full_name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "phone",
+    "type": "String"
+   },
+   {
+    "col": "photo",
+    "type": "String"
+   },
+   {
+    "col": "gender",
+    "type": "String",
+    "enum": [
+     "MALE",
+     "FEMALE",
+     "OTHER"
+    ]
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE",
+     "SUSPENDED"
+    ],
+    "default": "ACTIVE"
+   },
+   {
+    "col": "must_change_password",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "failed_attempts",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "locked_until",
+    "type": "String"
+   },
+   {
+    "col": "last_login_at",
+    "type": "String"
+   },
+   {
+    "col": "created_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "user_permissions",
+  "model": "UserPermission",
+  "fields": [
+   {
+    "col": "user_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "User"
+   },
+   {
+    "col": "permission_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Permission"
+   },
+   {
+    "col": "effect",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ALLOW",
+     "DENY"
+    ],
+    "default": "ALLOW"
+   },
+   {
+    "col": "granted_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (user_id, permission_id)"
+  ]
+ },
+ {
+  "table": "refresh_tokens",
+  "model": "RefreshToken",
+  "fields": [
+   {
+    "col": "user_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "User"
+   },
+   {
+    "col": "token_hash",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "user_agent",
+    "type": "String"
+   },
+   {
+    "col": "ip_address",
+    "type": "String"
+   },
+   {
+    "col": "expires_at",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "revoked_at",
+    "type": "String"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "departments",
+  "model": "Department",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "code",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "head_faculty_id",
+    "type": "Number"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (campus_id, code)"
+  ]
+ },
+ {
+  "table": "administrators",
+  "model": "Administrator",
+  "fields": [
+   {
+    "col": "user_id",
+    "type": "ObjectId",
+    "required": true,
+    "unique": true,
+    "ref": "User"
+   },
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "employee_code",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "designation",
+    "type": "String"
+   },
+   {
+    "col": "board",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "STATE",
+     "CBSE",
+     "BOTH"
+    ],
+    "default": "BOTH"
+   },
+   {
+    "col": "department_id",
+    "type": "ObjectId",
+    "ref": "Department"
+   },
+   {
+    "col": "date_of_joining",
+    "type": "String"
+   },
+   {
+    "col": "qualification",
+    "type": "String"
+   },
+   {
+    "col": "address",
+    "type": "String"
+   },
+   {
+    "col": "emergency_contact",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "faculty",
+  "model": "Faculty",
+  "fields": [
+   {
+    "col": "user_id",
+    "type": "ObjectId",
+    "required": true,
+    "unique": true,
+    "ref": "User"
+   },
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "faculty_code",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "staff_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "TEACHING",
+     "FINANCIAL"
+    ]
+   },
+   {
+    "col": "board",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "STATE",
+     "CBSE",
+     "BOTH"
+    ],
+    "default": "BOTH"
+   },
+   {
+    "col": "department_id",
+    "type": "ObjectId",
+    "ref": "Department"
+   },
+   {
+    "col": "designation",
+    "type": "String"
+   },
+   {
+    "col": "qualification",
+    "type": "String"
+   },
+   {
+    "col": "specialization",
+    "type": "String"
+   },
+   {
+    "col": "experience_years",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "date_of_birth",
+    "type": "String"
+   },
+   {
+    "col": "date_of_joining",
+    "type": "String"
+   },
+   {
+    "col": "blood_group",
+    "type": "String"
+   },
+   {
+    "col": "address",
+    "type": "String"
+   },
+   {
+    "col": "emergency_contact",
+    "type": "String"
+   },
+   {
+    "col": "bank_account",
+    "type": "String"
+   },
+   {
+    "col": "pan_number",
+    "type": "String"
+   },
+   {
+    "col": "is_mentor",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE",
+     "ON_LEAVE",
+     "RESIGNED"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "academic_years",
+  "model": "AcademicYear",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "start_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "end_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "is_current",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "CLOSED",
+     "UPCOMING"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (campus_id, name)"
+  ]
+ },
+ {
+  "table": "classes",
+  "model": "Class",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "academic_year_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "AcademicYear"
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "numeric_level",
+    "type": "Number"
+   },
+   {
+    "col": "stream",
+    "type": "String"
+   },
+   {
+    "col": "board",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "STATE",
+     "CBSE"
+    ],
+    "default": "STATE"
+   },
+   {
+    "col": "class_teacher_id",
+    "type": "ObjectId",
+    "ref": "Faculty"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (campus_id, academic_year_id, name, board)"
+  ]
+ },
+ {
+  "table": "sections",
+  "model": "Section",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "class_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Class"
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "capacity",
+    "type": "Number",
+    "required": true,
+    "default": 40
+   },
+   {
+    "col": "room_number",
+    "type": "String"
+   },
+   {
+    "col": "section_teacher_id",
+    "type": "ObjectId",
+    "ref": "Faculty"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (class_id, name)"
+  ]
+ },
+ {
+  "table": "subjects",
+  "model": "Subject",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "code",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "department_id",
+    "type": "ObjectId",
+    "ref": "Department"
+   },
+   {
+    "col": "type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "CORE",
+     "ELECTIVE",
+     "LANGUAGE",
+     "LAB",
+     "ACTIVITY"
+    ],
+    "default": "CORE"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (campus_id, code)"
+  ]
+ },
+ {
+  "table": "courses",
+  "model": "Cours",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "academic_year_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "AcademicYear"
+   },
+   {
+    "col": "subject_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Subject"
+   },
+   {
+    "col": "class_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Class"
+   },
+   {
+    "col": "code",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "credits",
+    "type": "Number",
+    "required": true,
+    "default": 4
+   },
+   {
+    "col": "max_marks",
+    "type": "Number",
+    "required": true,
+    "default": 100
+   },
+   {
+    "col": "pass_marks",
+    "type": "Number",
+    "required": true,
+    "default": 35
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE",
+     "ARCHIVED"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (campus_id, academic_year_id, code)"
+  ]
+ },
+ {
+  "table": "course_assignments",
+  "model": "CourseAssignment",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "course_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Cours"
+   },
+   {
+    "col": "faculty_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Faculty"
+   },
+   {
+    "col": "section_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Section"
+   },
+   {
+    "col": "academic_year_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "AcademicYear"
+   },
+   {
+    "col": "is_primary",
+    "type": "Number",
+    "required": true,
+    "default": 1
+   },
+   {
+    "col": "assigned_by",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (course_id, faculty_id, section_id)"
+  ]
+ },
+ {
+  "table": "students",
+  "model": "Student",
+  "fields": [
+   {
+    "col": "user_id",
+    "type": "ObjectId",
+    "unique": true,
+    "ref": "User"
+   },
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "admission_number",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "roll_number",
+    "type": "String"
+   },
+   {
+    "col": "first_name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "last_name",
+    "type": "String"
+   },
+   {
+    "col": "date_of_birth",
+    "type": "String"
+   },
+   {
+    "col": "gender",
+    "type": "String",
+    "enum": [
+     "MALE",
+     "FEMALE",
+     "OTHER"
+    ]
+   },
+   {
+    "col": "blood_group",
+    "type": "String"
+   },
+   {
+    "col": "photo",
+    "type": "String"
+   },
+   {
+    "col": "class_id",
+    "type": "ObjectId",
+    "ref": "Class"
+   },
+   {
+    "col": "section_id",
+    "type": "ObjectId",
+    "ref": "Section"
+   },
+   {
+    "col": "academic_year_id",
+    "type": "ObjectId",
+    "ref": "AcademicYear"
+   },
+   {
+    "col": "board",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "STATE",
+     "CBSE"
+    ],
+    "default": "STATE"
+   },
+   {
+    "col": "mentor_id",
+    "type": "ObjectId",
+    "ref": "Faculty"
+   },
+   {
+    "col": "phone",
+    "type": "String"
+   },
+   {
+    "col": "email",
+    "type": "String"
+   },
+   {
+    "col": "address",
+    "type": "String"
+   },
+   {
+    "col": "city",
+    "type": "String"
+   },
+   {
+    "col": "state",
+    "type": "String"
+   },
+   {
+    "col": "pincode",
+    "type": "String"
+   },
+   {
+    "col": "nationality",
+    "type": "String",
+    "default": "Indian"
+   },
+   {
+    "col": "religion",
+    "type": "String"
+   },
+   {
+    "col": "category",
+    "type": "String"
+   },
+   {
+    "col": "aadhaar_number",
+    "type": "String"
+   },
+   {
+    "col": "previous_school",
+    "type": "String"
+   },
+   {
+    "col": "admission_date",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE",
+     "ALUMNI",
+     "TRANSFERRED",
+     "SUSPENDED"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "parents",
+  "model": "Parent",
+  "fields": [
+   {
+    "col": "user_id",
+    "type": "ObjectId",
+    "unique": true,
+    "ref": "User"
+   },
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "parent_code",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "father_name",
+    "type": "String"
+   },
+   {
+    "col": "father_occupation",
+    "type": "String"
+   },
+   {
+    "col": "father_phone",
+    "type": "String"
+   },
+   {
+    "col": "mother_name",
+    "type": "String"
+   },
+   {
+    "col": "mother_occupation",
+    "type": "String"
+   },
+   {
+    "col": "mother_phone",
+    "type": "String"
+   },
+   {
+    "col": "guardian_name",
+    "type": "String"
+   },
+   {
+    "col": "relation",
+    "type": "String",
+    "default": "FATHER"
+   },
+   {
+    "col": "email",
+    "type": "String"
+   },
+   {
+    "col": "phone",
+    "type": "String"
+   },
+   {
+    "col": "address",
+    "type": "String"
+   },
+   {
+    "col": "annual_income",
+    "type": "Number"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "student_parents",
+  "model": "StudentParent",
+  "fields": [
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Student"
+   },
+   {
+    "col": "parent_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Parent"
+   },
+   {
+    "col": "relation",
+    "type": "String",
+    "required": true,
+    "default": "FATHER"
+   },
+   {
+    "col": "is_primary",
+    "type": "Number",
+    "required": true,
+    "default": 1
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (student_id, parent_id)"
+  ]
+ },
+ {
+  "table": "enrollments",
+  "model": "Enrollment",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Student"
+   },
+   {
+    "col": "academic_year_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "AcademicYear"
+   },
+   {
+    "col": "class_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Class"
+   },
+   {
+    "col": "section_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Section"
+   },
+   {
+    "col": "roll_number",
+    "type": "String"
+   },
+   {
+    "col": "enrollment_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "promoted_from",
+    "type": "ObjectId",
+    "ref": "Class"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "COMPLETED",
+     "WITHDRAWN"
+    ],
+    "default": "ACTIVE"
+   },
+   {
+    "col": "remarks",
+    "type": "String"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (student_id, academic_year_id)"
+  ]
+ },
+ {
+  "table": "documents",
+  "model": "Document",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "owner_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "STUDENT",
+     "FACULTY",
+     "ADMINISTRATOR",
+     "PARENT"
+    ]
+   },
+   {
+    "col": "owner_id",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "title",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "document_type",
+    "type": "String"
+   },
+   {
+    "col": "file_path",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "file_name",
+    "type": "String"
+   },
+   {
+    "col": "file_size",
+    "type": "Number"
+   },
+   {
+    "col": "mime_type",
+    "type": "String"
+   },
+   {
+    "col": "uploaded_by",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "verified",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "attendance",
+  "model": "Attendance",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Student"
+   },
+   {
+    "col": "course_id",
+    "type": "ObjectId",
+    "ref": "Cours"
+   },
+   {
+    "col": "section_id",
+    "type": "ObjectId",
+    "ref": "Section"
+   },
+   {
+    "col": "academic_year_id",
+    "type": "ObjectId",
+    "ref": "AcademicYear"
+   },
+   {
+    "col": "attendance_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "period",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "PRESENT",
+     "ABSENT"
+    ]
+   },
+   {
+    "col": "remarks",
+    "type": "String"
+   },
+   {
+    "col": "marked_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (student_id, attendance_date, course_id, period)"
+  ]
+ },
+ {
+  "table": "faculty_attendance",
+  "model": "FacultyAttendance",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "faculty_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Faculty"
+   },
+   {
+    "col": "attendance_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "PRESENT",
+     "ABSENT",
+     "LATE",
+     "LEAVE",
+     "HALF_DAY"
+    ]
+   },
+   {
+    "col": "remarks",
+    "type": "String"
+   },
+   {
+    "col": "marked_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": [
+   "check_in        TEXT",
+   "check_out       TEXT",
+   "UNIQUE (faculty_id, attendance_date)"
+  ]
+ },
+ {
+  "table": "leave_requests",
+  "model": "LeaveRequest",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "requester_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "STUDENT",
+     "FACULTY"
+    ]
+   },
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "ref": "Student"
+   },
+   {
+    "col": "faculty_id",
+    "type": "ObjectId",
+    "ref": "Faculty"
+   },
+   {
+    "col": "raised_by",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "leave_type",
+    "type": "String",
+    "required": true,
+    "default": "CASUAL"
+   },
+   {
+    "col": "from_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "to_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "days",
+    "type": "Number"
+   },
+   {
+    "col": "reason",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "attachment",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "PENDING",
+     "APPROVED",
+     "REJECTED",
+     "CANCELLED"
+    ],
+    "default": "PENDING"
+   },
+   {
+    "col": "reviewed_by",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "reviewed_at",
+    "type": "String"
+   },
+   {
+    "col": "review_remarks",
+    "type": "String"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "examinations",
+  "model": "Examination",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "academic_year_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "AcademicYear"
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "exam_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "UNIT_TEST",
+     "TERM",
+     "MID_TERM",
+     "FINAL",
+     "PRACTICAL",
+     "ASSIGNMENT"
+    ],
+    "default": "TERM"
+   },
+   {
+    "col": "start_date",
+    "type": "String"
+   },
+   {
+    "col": "end_date",
+    "type": "String"
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "weightage",
+    "type": "Number",
+    "default": 100
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "DRAFT",
+     "SCHEDULED",
+     "ONGOING",
+     "COMPLETED",
+     "RESULTS_PUBLISHED"
+    ],
+    "default": "SCHEDULED"
+   },
+   {
+    "col": "created_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "exam_subjects",
+  "model": "ExamSubject",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "examination_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Examination"
+   },
+   {
+    "col": "course_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Cours"
+   },
+   {
+    "col": "class_id",
+    "type": "ObjectId",
+    "ref": "Class"
+   },
+   {
+    "col": "exam_date",
+    "type": "String"
+   },
+   {
+    "col": "start_time",
+    "type": "String"
+   },
+   {
+    "col": "end_time",
+    "type": "String"
+   },
+   {
+    "col": "room",
+    "type": "String"
+   },
+   {
+    "col": "max_marks",
+    "type": "Number",
+    "required": true,
+    "default": 100
+   },
+   {
+    "col": "pass_marks",
+    "type": "Number",
+    "required": true,
+    "default": 35
+   },
+   {
+    "col": "invigilator_id",
+    "type": "ObjectId",
+    "ref": "Faculty"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (examination_id, course_id)"
+  ]
+ },
+ {
+  "table": "grades",
+  "model": "Grade",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "code",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "name",
+    "type": "String"
+   },
+   {
+    "col": "min_percent",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "max_percent",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "grade_point",
+    "type": "Number"
+   },
+   {
+    "col": "remarks",
+    "type": "String"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (campus_id, code)"
+  ]
+ },
+ {
+  "table": "marks",
+  "model": "Mark",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "examination_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Examination"
+   },
+   {
+    "col": "exam_subject_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "ExamSubject"
+   },
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Student"
+   },
+   {
+    "col": "course_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Cours"
+   },
+   {
+    "col": "marks_obtained",
+    "type": "Number"
+   },
+   {
+    "col": "max_marks",
+    "type": "Number",
+    "required": true,
+    "default": 100
+   },
+   {
+    "col": "grade",
+    "type": "String"
+   },
+   {
+    "col": "is_absent",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "remarks",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "DRAFT",
+     "SUBMITTED",
+     "APPROVED",
+     "REJECTED"
+    ],
+    "default": "DRAFT"
+   },
+   {
+    "col": "entered_by",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "submitted_at",
+    "type": "String"
+   },
+   {
+    "col": "approved_by",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "approved_at",
+    "type": "String"
+   },
+   {
+    "col": "rejection_reason",
+    "type": "String"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (exam_subject_id, student_id)"
+  ]
+ },
+ {
+  "table": "results",
+  "model": "Result",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "examination_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Examination"
+   },
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Student"
+   },
+   {
+    "col": "class_id",
+    "type": "ObjectId",
+    "ref": "Class"
+   },
+   {
+    "col": "section_id",
+    "type": "ObjectId",
+    "ref": "Section"
+   },
+   {
+    "col": "total_marks",
+    "type": "Number"
+   },
+   {
+    "col": "obtained_marks",
+    "type": "Number"
+   },
+   {
+    "col": "percentage",
+    "type": "Number"
+   },
+   {
+    "col": "grade",
+    "type": "String"
+   },
+   {
+    "col": "rank_in_class",
+    "type": "Number"
+   },
+   {
+    "col": "attendance_percent",
+    "type": "Number"
+   },
+   {
+    "col": "result_status",
+    "type": "String",
+    "enum": [
+     "PASS",
+     "FAIL",
+     "PENDING"
+    ]
+   },
+   {
+    "col": "remarks",
+    "type": "String"
+   },
+   {
+    "col": "published",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "published_by",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "published_at",
+    "type": "String"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (examination_id, student_id)"
+  ]
+ },
+ {
+  "table": "timetables",
+  "model": "Timetable",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "academic_year_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "AcademicYear"
+   },
+   {
+    "col": "class_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Class"
+   },
+   {
+    "col": "section_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Section"
+   },
+   {
+    "col": "course_id",
+    "type": "ObjectId",
+    "ref": "Cours"
+   },
+   {
+    "col": "faculty_id",
+    "type": "ObjectId",
+    "ref": "Faculty"
+   },
+   {
+    "col": "day_of_week",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "period",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "start_time",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "end_time",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "room",
+    "type": "String"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (section_id, day_of_week, period, academic_year_id)"
+  ]
+ },
+ {
+  "table": "course_materials",
+  "model": "CourseMaterial",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "course_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Cours"
+   },
+   {
+    "col": "section_id",
+    "type": "ObjectId",
+    "ref": "Section"
+   },
+   {
+    "col": "faculty_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Faculty"
+   },
+   {
+    "col": "title",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "material_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "NOTES",
+     "PDF",
+     "PRESENTATION",
+     "VIDEO",
+     "LINK",
+     "ASSIGNMENT",
+     "OTHER"
+    ],
+    "default": "NOTES"
+   },
+   {
+    "col": "file_path",
+    "type": "String"
+   },
+   {
+    "col": "file_name",
+    "type": "String"
+   },
+   {
+    "col": "file_size",
+    "type": "Number"
+   },
+   {
+    "col": "external_url",
+    "type": "String"
+   },
+   {
+    "col": "due_date",
+    "type": "String"
+   },
+   {
+    "col": "is_published",
+    "type": "Number",
+    "required": true,
+    "default": 1
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "mentoring_records",
+  "model": "MentoringRecord",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Student"
+   },
+   {
+    "col": "mentor_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Faculty"
+   },
+   {
+    "col": "record_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "GUIDANCE",
+     "REMARK",
+     "MEETING",
+     "ACHIEVEMENT",
+     "CONCERN"
+    ],
+    "default": "GUIDANCE"
+   },
+   {
+    "col": "title",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "notes",
+    "type": "String"
+   },
+   {
+    "col": "meeting_date",
+    "type": "String"
+   },
+   {
+    "col": "action_items",
+    "type": "String"
+   },
+   {
+    "col": "follow_up_date",
+    "type": "String"
+   },
+   {
+    "col": "visible_to_parent",
+    "type": "Number",
+    "required": true,
+    "default": 1
+   },
+   {
+    "col": "created_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "fee_categories",
+  "model": "FeeCategory",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "code",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "is_recurring",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "frequency",
+    "type": "String",
+    "enum": [
+     "ANNUAL",
+     "TERM",
+     "MONTHLY",
+     "ONE_TIME"
+    ],
+    "default": "ANNUAL"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (campus_id, code)"
+  ]
+ },
+ {
+  "table": "fee_structures",
+  "model": "FeeStructure",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "academic_year_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "AcademicYear"
+   },
+   {
+    "col": "class_id",
+    "type": "ObjectId",
+    "ref": "Class"
+   },
+   {
+    "col": "fee_category_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "FeeCategory"
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "amount",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "due_date",
+    "type": "String"
+   },
+   {
+    "col": "late_fee_per_day",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "student_fees",
+  "model": "StudentFee",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Student"
+   },
+   {
+    "col": "fee_structure_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "FeeStructure"
+   },
+   {
+    "col": "academic_year_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "AcademicYear"
+   },
+   {
+    "col": "total_amount",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "discount_amount",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "concession_reason",
+    "type": "String"
+   },
+   {
+    "col": "paid_amount",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "due_date",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "PENDING",
+     "PARTIAL",
+     "PAID",
+     "OVERDUE",
+     "WAIVED"
+    ],
+    "default": "PENDING"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (student_id, fee_structure_id)"
+  ]
+ },
+ {
+  "table": "fee_payments",
+  "model": "FeePayment",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "student_fee_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "StudentFee"
+   },
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Student"
+   },
+   {
+    "col": "amount",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "payment_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "payment_mode",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "CASH",
+     "CHEQUE",
+     "ONLINE",
+     "UPI",
+     "CARD",
+     "NEFT",
+     "DD"
+    ],
+    "default": "CASH"
+   },
+   {
+    "col": "transaction_ref",
+    "type": "String"
+   },
+   {
+    "col": "bank_name",
+    "type": "String"
+   },
+   {
+    "col": "remarks",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "SUCCESS",
+     "PENDING",
+     "FAILED",
+     "REFUNDED"
+    ],
+    "default": "SUCCESS"
+   },
+   {
+    "col": "collected_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "fee_receipts",
+  "model": "FeeReceipt",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "fee_payment_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "FeePayment"
+   },
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Student"
+   },
+   {
+    "col": "receipt_number",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "amount",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "amount_in_words",
+    "type": "String"
+   },
+   {
+    "col": "issued_by",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "issued_at",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "cancelled",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "income",
+  "model": "Income",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "category",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "title",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "amount",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "income_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "payment_mode",
+    "type": "String",
+    "default": "CASH"
+   },
+   {
+    "col": "reference",
+    "type": "String"
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "recorded_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "expenses",
+  "model": "Expens",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "category",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "title",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "amount",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "expense_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "payment_mode",
+    "type": "String",
+    "default": "CASH"
+   },
+   {
+    "col": "vendor",
+    "type": "String"
+   },
+   {
+    "col": "bill_number",
+    "type": "String"
+   },
+   {
+    "col": "attachment",
+    "type": "String"
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "approved_by",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "PENDING",
+     "APPROVED",
+     "REJECTED"
+    ],
+    "default": "APPROVED"
+   },
+   {
+    "col": "recorded_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "petty_cash",
+  "model": "PettyCash",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "entry_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "entry_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "IN",
+     "OUT"
+    ]
+   },
+   {
+    "col": "amount",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "purpose",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "balance_after",
+    "type": "Number"
+   },
+   {
+    "col": "handled_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "salary_structures",
+  "model": "SalaryStructure",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "user_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "User"
+   },
+   {
+    "col": "basic_salary",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "hra",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "da",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "conveyance",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "medical",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "other_allowances",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "pf_deduction",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "tax_deduction",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "other_deductions",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "effective_from",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "payroll",
+  "model": "Payroll",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "user_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "User"
+   },
+   {
+    "col": "month",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "year",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "basic_salary",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "total_allowances",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "total_deductions",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "working_days",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "present_days",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "lop_days",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "gross_salary",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "net_salary",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "payslip_number",
+    "type": "String",
+    "unique": true
+   },
+   {
+    "col": "payment_date",
+    "type": "String"
+   },
+   {
+    "col": "payment_mode",
+    "type": "String",
+    "default": "NEFT"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "DRAFT",
+     "PROCESSED",
+     "PAID",
+     "HOLD"
+    ],
+    "default": "DRAFT"
+   },
+   {
+    "col": "processed_by",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "remarks",
+    "type": "String"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (user_id, month, year)"
+  ]
+ },
+ {
+  "table": "vehicles",
+  "model": "Vehicle",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "vehicle_number",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "vehicle_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "BUS",
+     "VAN",
+     "CAR",
+     "MINI_BUS"
+    ],
+    "default": "BUS"
+   },
+   {
+    "col": "model",
+    "type": "String"
+   },
+   {
+    "col": "capacity",
+    "type": "Number",
+    "required": true,
+    "default": 40
+   },
+   {
+    "col": "registration_date",
+    "type": "String"
+   },
+   {
+    "col": "insurance_expiry",
+    "type": "String"
+   },
+   {
+    "col": "fitness_expiry",
+    "type": "String"
+   },
+   {
+    "col": "gps_device_id",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "MAINTENANCE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "drivers",
+  "model": "Driver",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "phone",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "license_number",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "license_expiry",
+    "type": "String"
+   },
+   {
+    "col": "address",
+    "type": "String"
+   },
+   {
+    "col": "photo",
+    "type": "String"
+   },
+   {
+    "col": "date_of_joining",
+    "type": "String"
+   },
+   {
+    "col": "salary",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "vehicle_id",
+    "type": "ObjectId",
+    "ref": "Vehicle"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "routes",
+  "model": "Route",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "route_code",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "start_point",
+    "type": "String"
+   },
+   {
+    "col": "end_point",
+    "type": "String"
+   },
+   {
+    "col": "distance_km",
+    "type": "Number"
+   },
+   {
+    "col": "stops",
+    "type": "String"
+   },
+   {
+    "col": "vehicle_id",
+    "type": "ObjectId",
+    "ref": "Vehicle"
+   },
+   {
+    "col": "driver_id",
+    "type": "ObjectId",
+    "ref": "Driver"
+   },
+   {
+    "col": "fare",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "morning_start",
+    "type": "String"
+   },
+   {
+    "col": "evening_start",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (campus_id, route_code)"
+  ]
+ },
+ {
+  "table": "transport_allocations",
+  "model": "TransportAllocation",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Student"
+   },
+   {
+    "col": "route_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Route"
+   },
+   {
+    "col": "vehicle_id",
+    "type": "ObjectId",
+    "ref": "Vehicle"
+   },
+   {
+    "col": "pickup_point",
+    "type": "String"
+   },
+   {
+    "col": "drop_point",
+    "type": "String"
+   },
+   {
+    "col": "pickup_time",
+    "type": "String"
+   },
+   {
+    "col": "drop_time",
+    "type": "String"
+   },
+   {
+    "col": "academic_year_id",
+    "type": "ObjectId",
+    "ref": "AcademicYear"
+   },
+   {
+    "col": "fare",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "INACTIVE"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "fuel_records",
+  "model": "FuelRecord",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "vehicle_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Vehicle"
+   },
+   {
+    "col": "fuel_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "litres",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "rate_per_litre",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "total_cost",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "odometer",
+    "type": "Number"
+   },
+   {
+    "col": "filled_by",
+    "type": "String"
+   },
+   {
+    "col": "bill_number",
+    "type": "String"
+   },
+   {
+    "col": "recorded_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "vehicle_maintenance",
+  "model": "VehicleMaintenance",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "vehicle_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Vehicle"
+   },
+   {
+    "col": "service_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "service_type",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "cost",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "garage",
+    "type": "String"
+   },
+   {
+    "col": "next_service_date",
+    "type": "String"
+   },
+   {
+    "col": "recorded_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "driver_attendance",
+  "model": "DriverAttendance",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "driver_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Driver"
+   },
+   {
+    "col": "attendance_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "PRESENT",
+     "ABSENT",
+     "LEAVE"
+    ]
+   },
+   {
+    "col": "remarks",
+    "type": "String"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (driver_id, attendance_date)"
+  ]
+ },
+ {
+  "table": "books",
+  "model": "Book",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "isbn",
+    "type": "String"
+   },
+   {
+    "col": "title",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "author",
+    "type": "String"
+   },
+   {
+    "col": "publisher",
+    "type": "String"
+   },
+   {
+    "col": "category",
+    "type": "String"
+   },
+   {
+    "col": "edition",
+    "type": "String"
+   },
+   {
+    "col": "language",
+    "type": "String",
+    "default": "English"
+   },
+   {
+    "col": "rack_number",
+    "type": "String"
+   },
+   {
+    "col": "total_copies",
+    "type": "Number",
+    "required": true,
+    "default": 1
+   },
+   {
+    "col": "available_copies",
+    "type": "Number",
+    "required": true,
+    "default": 1
+   },
+   {
+    "col": "price",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "purchase_date",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "LOST",
+     "DAMAGED",
+     "ARCHIVED"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "book_transactions",
+  "model": "BookTransaction",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "book_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Book"
+   },
+   {
+    "col": "member_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "STUDENT",
+     "FACULTY"
+    ],
+    "default": "STUDENT"
+   },
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "ref": "Student"
+   },
+   {
+    "col": "faculty_id",
+    "type": "ObjectId",
+    "ref": "Faculty"
+   },
+   {
+    "col": "issue_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "due_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "return_date",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ISSUED",
+     "RETURNED",
+     "OVERDUE",
+     "LOST"
+    ],
+    "default": "ISSUED"
+   },
+   {
+    "col": "issued_by",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "remarks",
+    "type": "String"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "fines",
+  "model": "Fine",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "book_transaction_id",
+    "type": "ObjectId",
+    "ref": "BookTransaction"
+   },
+   {
+    "col": "student_id",
+    "type": "ObjectId",
+    "ref": "Student"
+   },
+   {
+    "col": "faculty_id",
+    "type": "ObjectId",
+    "ref": "Faculty"
+   },
+   {
+    "col": "fine_type",
+    "type": "String",
+    "required": true,
+    "default": "LATE_RETURN"
+   },
+   {
+    "col": "amount",
+    "type": "Number",
+    "required": true
+   },
+   {
+    "col": "reason",
+    "type": "String"
+   },
+   {
+    "col": "paid",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "paid_date",
+    "type": "String"
+   },
+   {
+    "col": "collected_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "inventory_categories",
+  "model": "InventoryCategory",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "code",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "description",
+    "type": "String"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (campus_id, code)"
+  ]
+ },
+ {
+  "table": "inventory_items",
+  "model": "InventoryItem",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "category_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "InventoryCategory"
+   },
+   {
+    "col": "item_code",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "quantity",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "unit",
+    "type": "String",
+    "default": "PCS"
+   },
+   {
+    "col": "reorder_level",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "location",
+    "type": "String"
+   },
+   {
+    "col": "condition_status",
+    "type": "String",
+    "enum": [
+     "NEW",
+     "GOOD",
+     "FAIR",
+     "POOR",
+     "DAMAGED"
+    ],
+    "default": "GOOD"
+   },
+   {
+    "col": "purchase_date",
+    "type": "String"
+   },
+   {
+    "col": "vendor",
+    "type": "String"
+   },
+   {
+    "col": "unit_cost",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "department_id",
+    "type": "ObjectId",
+    "ref": "Department"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ACTIVE",
+     "CONSUMED",
+     "DISPOSED"
+    ],
+    "default": "ACTIVE"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (campus_id, item_code)"
+  ]
+ },
+ {
+  "table": "purchases",
+  "model": "Purchas",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "purchase_order",
+    "type": "String"
+   },
+   {
+    "col": "item_id",
+    "type": "ObjectId",
+    "ref": "InventoryItem"
+   },
+   {
+    "col": "item_name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "vendor",
+    "type": "String"
+   },
+   {
+    "col": "quantity",
+    "type": "Number",
+    "required": true,
+    "default": 1
+   },
+   {
+    "col": "unit_cost",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "total_cost",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "purchase_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "invoice_number",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ORDERED",
+     "RECEIVED",
+     "CANCELLED"
+    ],
+    "default": "RECEIVED"
+   },
+   {
+    "col": "recorded_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "assets",
+  "model": "Asset",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "asset_code",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "name",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "asset_type",
+    "type": "String"
+   },
+   {
+    "col": "serial_number",
+    "type": "String"
+   },
+   {
+    "col": "purchase_date",
+    "type": "String"
+   },
+   {
+    "col": "purchase_cost",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "current_value",
+    "type": "Number",
+    "default": 0
+   },
+   {
+    "col": "vendor",
+    "type": "String"
+   },
+   {
+    "col": "location",
+    "type": "String"
+   },
+   {
+    "col": "department_id",
+    "type": "ObjectId",
+    "ref": "Department"
+   },
+   {
+    "col": "assigned_to",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "condition_status",
+    "type": "String",
+    "default": "GOOD"
+   },
+   {
+    "col": "warranty_expiry",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "IN_USE",
+     "IN_STORE",
+     "UNDER_REPAIR",
+     "DISPOSED"
+    ],
+    "default": "IN_USE"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (campus_id, asset_code)"
+  ]
+ },
+ {
+  "table": "announcements",
+  "model": "Announcement",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "title",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "content",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "category",
+    "type": "String",
+    "default": "GENERAL"
+   },
+   {
+    "col": "priority",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "LOW",
+     "NORMAL",
+     "HIGH",
+     "URGENT"
+    ],
+    "default": "NORMAL"
+   },
+   {
+    "col": "target_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ALL",
+     "STUDENTS",
+     "PARENTS",
+     "FACULTY",
+     "TEACHING_STAFF",
+     "FINANCIAL_STAFF",
+     "ADMINISTRATORS",
+     "CLASS",
+     "SECTION"
+    ],
+    "default": "ALL"
+   },
+   {
+    "col": "target_class_id",
+    "type": "ObjectId",
+    "ref": "Class"
+   },
+   {
+    "col": "target_section_id",
+    "type": "ObjectId",
+    "ref": "Section"
+   },
+   {
+    "col": "attachment",
+    "type": "String"
+   },
+   {
+    "col": "publish_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "expiry_date",
+    "type": "String"
+   },
+   {
+    "col": "is_published",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "created_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "notices",
+  "model": "Notice",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "notice_number",
+    "type": "String"
+   },
+   {
+    "col": "title",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "content",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "target_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ALL",
+     "STUDENTS",
+     "PARENTS",
+     "FACULTY",
+     "TEACHING_STAFF",
+     "FINANCIAL_STAFF",
+     "ADMINISTRATORS",
+     "CLASS",
+     "SECTION"
+    ],
+    "default": "ALL"
+   },
+   {
+    "col": "target_class_id",
+    "type": "ObjectId",
+    "ref": "Class"
+   },
+   {
+    "col": "target_section_id",
+    "type": "ObjectId",
+    "ref": "Section"
+   },
+   {
+    "col": "attachment",
+    "type": "String"
+   },
+   {
+    "col": "notice_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "expiry_date",
+    "type": "String"
+   },
+   {
+    "col": "is_published",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "created_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "circulars",
+  "model": "Circular",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "circular_number",
+    "type": "String"
+   },
+   {
+    "col": "title",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "content",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "target_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "ALL",
+     "STUDENTS",
+     "PARENTS",
+     "FACULTY",
+     "TEACHING_STAFF",
+     "FINANCIAL_STAFF",
+     "ADMINISTRATORS",
+     "CLASS",
+     "SECTION"
+    ],
+    "default": "ALL"
+   },
+   {
+    "col": "target_class_id",
+    "type": "ObjectId",
+    "ref": "Class"
+   },
+   {
+    "col": "target_section_id",
+    "type": "ObjectId",
+    "ref": "Section"
+   },
+   {
+    "col": "attachment",
+    "type": "String"
+   },
+   {
+    "col": "issue_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "is_published",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "created_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "messages",
+  "model": "Message",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "sender_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "User"
+   },
+   {
+    "col": "recipient_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "User"
+   },
+   {
+    "col": "parent_message_id",
+    "type": "ObjectId",
+    "ref": "Message"
+   },
+   {
+    "col": "subject",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "body",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "attachment",
+    "type": "String"
+   },
+   {
+    "col": "context_student_id",
+    "type": "ObjectId",
+    "ref": "Student"
+   },
+   {
+    "col": "is_read",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "read_at",
+    "type": "String"
+   },
+   {
+    "col": "sender_deleted",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "recipient_deleted",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "notifications",
+  "model": "Notification",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "ref": "Campus"
+   },
+   {
+    "col": "user_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "User"
+   },
+   {
+    "col": "type",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "title",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "body",
+    "type": "String"
+   },
+   {
+    "col": "link",
+    "type": "String"
+   },
+   {
+    "col": "entity_type",
+    "type": "String"
+   },
+   {
+    "col": "entity_id",
+    "type": "Number"
+   },
+   {
+    "col": "is_read",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "read_at",
+    "type": "String"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "events",
+  "model": "Event",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "Campus"
+   },
+   {
+    "col": "title",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "event_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "EVENT",
+     "HOLIDAY",
+     "EXAM",
+     "MEETING",
+     "SPORTS",
+     "CULTURAL",
+     "PTM"
+    ],
+    "default": "EVENT"
+   },
+   {
+    "col": "start_date",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "end_date",
+    "type": "String"
+   },
+   {
+    "col": "start_time",
+    "type": "String"
+   },
+   {
+    "col": "end_time",
+    "type": "String"
+   },
+   {
+    "col": "venue",
+    "type": "String"
+   },
+   {
+    "col": "target_type",
+    "type": "String",
+    "required": true,
+    "default": "ALL"
+   },
+   {
+    "col": "banner",
+    "type": "String"
+   },
+   {
+    "col": "is_published",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "created_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "activity_logs",
+  "model": "ActivityLog",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "ref": "Campus"
+   },
+   {
+    "col": "user_id",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "user_name",
+    "type": "String"
+   },
+   {
+    "col": "role_code",
+    "type": "String"
+   },
+   {
+    "col": "action",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "module",
+    "type": "String"
+   },
+   {
+    "col": "entity_type",
+    "type": "String"
+   },
+   {
+    "col": "entity_id",
+    "type": "Number"
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "old_values",
+    "type": "String"
+   },
+   {
+    "col": "new_values",
+    "type": "String"
+   },
+   {
+    "col": "ip_address",
+    "type": "String"
+   },
+   {
+    "col": "user_agent",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "SUCCESS",
+     "FAILED"
+    ],
+    "default": "SUCCESS"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "system_settings",
+  "model": "SystemSetting",
+  "fields": [
+   {
+    "col": "campus_id",
+    "type": "ObjectId",
+    "ref": "Campus"
+   },
+   {
+    "col": "category",
+    "type": "String",
+    "required": true,
+    "default": "GENERAL"
+   },
+   {
+    "col": "key",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "value",
+    "type": "String"
+   },
+   {
+    "col": "value_type",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "STRING",
+     "NUMBER",
+     "BOOLEAN",
+     "JSON"
+    ],
+    "default": "STRING"
+   },
+   {
+    "col": "label",
+    "type": "String"
+   },
+   {
+    "col": "description",
+    "type": "String"
+   },
+   {
+    "col": "is_public",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   },
+   {
+    "col": "updated_by",
+    "type": "ObjectId",
+    "ref": "User"
+   }
+  ],
+  "tableLevel": [
+   "UNIQUE (campus_id, key)"
+  ]
+ },
+ {
+  "table": "password_reset_requests",
+  "model": "PasswordResetRequest",
+  "fields": [
+   {
+    "col": "user_id",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "submitted_login",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "contact",
+    "type": "String"
+   },
+   {
+    "col": "reason",
+    "type": "String"
+   },
+   {
+    "col": "status",
+    "type": "String",
+    "required": true,
+    "enum": [
+     "PENDING",
+     "COMPLETED",
+     "REJECTED"
+    ],
+    "default": "PENDING"
+   },
+   {
+    "col": "handled_by",
+    "type": "ObjectId",
+    "ref": "User"
+   },
+   {
+    "col": "handled_at",
+    "type": "String"
+   },
+   {
+    "col": "handled_note",
+    "type": "String"
+   },
+   {
+    "col": "ip_address",
+    "type": "String"
+   }
+  ],
+  "tableLevel": []
+ },
+ {
+  "table": "push_subscriptions",
+  "model": "PushSubscription",
+  "fields": [
+   {
+    "col": "user_id",
+    "type": "ObjectId",
+    "required": true,
+    "ref": "User"
+   },
+   {
+    "col": "endpoint",
+    "type": "String",
+    "required": true,
+    "unique": true
+   },
+   {
+    "col": "p256dh",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "auth",
+    "type": "String",
+    "required": true
+   },
+   {
+    "col": "user_agent",
+    "type": "String"
+   },
+   {
+    "col": "last_used_at",
+    "type": "String"
+   },
+   {
+    "col": "failures",
+    "type": "Number",
+    "required": true,
+    "default": 0
+   }
+  ],
+  "tableLevel": []
+ }
+]
