@@ -184,8 +184,9 @@ materialsRouter.post(
       is_published: z.coerce.boolean().default(true),
     });
     const parsed = schema.safeParse(req.body);
+    // Nothing has been stored yet — the file is still in memory — so a refused
+    // request simply leaves nothing behind.
     if (!parsed.success) {
-      if (req.file) deleteUpload(publicPath(req.file));
       throw badRequest(parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join(', '));
     }
     const body = parsed.data;
@@ -193,7 +194,6 @@ materialsRouter.post(
     const facultyId = await facultyIdOf(req.user);
     if (isTeacher(req.user)) {
       if (!await teacherOwnsCourse(req.user, body.course_id, body.section_id || null)) {
-        if (req.file) deleteUpload(publicPath(req.file));
         throw forbidden('You may only upload material for courses assigned to you');
       }
     }
@@ -202,21 +202,31 @@ materialsRouter.post(
     const course = await get('SELECT * FROM courses WHERE id = ?', [body.course_id]);
     if (!course) throw notFound('Course not found');
 
-    const id = await insert('course_materials', {
-      campus_id: course.campus_id,
-      course_id: body.course_id,
-      section_id: body.section_id ?? null,
-      faculty_id: facultyId ?? (Number(req.body.faculty_id) || null),
-      title: body.title,
-      description: body.description,
-      material_type: body.material_type,
-      file_path: req.file ? publicPath(req.file) : null,
-      file_name: req.file?.originalname ?? null,
-      file_size: req.file?.size ?? null,
-      external_url: body.external_url,
-      due_date: body.due_date,
-      is_published: body.is_published ? 1 : 0,
-    });
+    // Store the file, then record it. If recording fails — a missing faculty
+    // member, a constraint — the stored file has nothing pointing at it and
+    // would sit in the bucket for ever, so it is removed on the way out.
+    const filePath = req.file ? await publicPath(req.file, 'materials') : null;
+    let id;
+    try {
+      id = await insert('course_materials', {
+        campus_id: course.campus_id,
+        course_id: body.course_id,
+        section_id: body.section_id ?? null,
+        faculty_id: facultyId ?? (Number(req.body.faculty_id) || null),
+        title: body.title,
+        description: body.description,
+        material_type: body.material_type,
+        file_path: filePath,
+        file_name: req.file?.originalname ?? null,
+        file_size: req.file?.size ?? null,
+        external_url: body.external_url,
+        due_date: body.due_date,
+        is_published: body.is_published ? 1 : 0,
+      });
+    } catch (error) {
+      if (filePath) await deleteUpload(filePath).catch(() => {});
+      throw error;
+    }
 
     // Tell the class a new material is available.
     if (body.is_published) {
@@ -262,7 +272,7 @@ materialsRouter.delete(
     if (isTeacher(req.user) && material.faculty_id !== await facultyIdOf(req.user)) {
       throw forbidden('You may only remove your own material');
     }
-    if (material.file_path) deleteUpload(material.file_path);
+    if (material.file_path) await deleteUpload(material.file_path);
     await update('course_materials', id, { file_path: null, file_name: null, file_size: null });
     return ok(res, { id, file_removed: true });
   })

@@ -224,9 +224,23 @@ host every request between them is cross-site, and a `lax` cookie is not sent
 cross-site — so signing in appears to work and the session is gone on the next
 page load. It requires https, which both hosts provide.
 
-Uploaded files stay on the API host's disk. That is why the API needs a host
-with persistent storage, and why it will not run on Cloudflare Workers as it
-stands.
+### Uploaded files
+
+Photographs, documents and course materials go to object storage when it is
+configured, and to a folder beside the server when it is not.
+
+The distinction matters on a host. Most give a container a fresh filesystem on
+every deploy, so files written beside the server disappear at the next release —
+the records survive, since they are in PostgreSQL, but the files they point at do
+not, and nobody notices until a parent opens a blank document.
+
+Any S3-compatible service works; Cloudflare R2 has a free tier and no egress
+charges. Set `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID` and
+`S3_SECRET_ACCESS_KEY` (see `.env.example`) and that is the whole change: files
+are addressed by the same paths either way, so nothing else differs. Leave them
+unset for development.
+
+`/api/health` reports which store is in use, along with the database.
 
 ### Device notifications
 

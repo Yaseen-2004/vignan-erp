@@ -38,6 +38,16 @@ export const env = {
   // Retained so the one-off importer can find a pre-migration SQLite file.
   databaseFile: process.env.DATABASE_FILE || path.join(SERVER_ROOT, 'data', 'vignan_erp.db'),
   uploadDir: process.env.UPLOAD_DIR || path.join(SERVER_ROOT, 'uploads'),
+
+  // Uploaded files — photographs, documents, course materials. Set these and
+  // they are kept in object storage, which survives a redeploy; leave them and
+  // they go to uploadDir above, which on most hosts does not. Any S3-compatible
+  // service works: Cloudflare R2, Amazon S3, Backblaze B2, MinIO.
+  s3Bucket: process.env.S3_BUCKET || '',
+  s3Endpoint: process.env.S3_ENDPOINT || '',
+  s3Region: process.env.S3_REGION || 'auto',
+  s3AccessKeyId: process.env.S3_ACCESS_KEY_ID || '',
+  s3SecretAccessKey: process.env.S3_SECRET_ACCESS_KEY || '',
   maxUploadMb: Number(process.env.MAX_UPLOAD_MB || 10),
 
   // Device notifications. The keys are this server's own identity to the push

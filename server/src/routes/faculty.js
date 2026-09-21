@@ -353,7 +353,7 @@ router.post(
     const faculty = await get('SELECT * FROM faculty WHERE id = ?', [id]);
     if (!faculty) throw notFound('Faculty member not found');
     if (!req.file) throw badRequest('No photo was uploaded');
-    const path = publicPath(req.file);
+    const path = await publicPath(req.file, 'photos');
     await update('users', faculty.user_id, { photo: path });
     await logActivity({ req, action: 'UPDATE', module: 'faculty', entityType: 'Faculty', entityId: id, description: 'Updated photo' });
     return ok(res, { id, photo: path });
@@ -377,7 +377,7 @@ router.post(
       owner_id: id,
       title: req.body.title || req.file.originalname,
       document_type: req.body.document_type || 'GENERAL',
-      file_path: publicPath(req.file),
+      file_path: await publicPath(req.file, 'documents'),
       file_name: req.file.originalname,
       file_size: req.file.size,
       mime_type: req.file.mimetype,

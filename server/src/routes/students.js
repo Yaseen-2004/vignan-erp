@@ -677,7 +677,7 @@ router.post(
     const student = await assertStudentAccess(req.user, id);
     if (!req.file) throw badRequest('No photo was uploaded');
 
-    const path = publicPath(req.file);
+    const path = await publicPath(req.file, 'photos');
     await update('students', id, { photo: path });
     if (student.user_id) await update('users', student.user_id, { photo: path });
 
@@ -720,7 +720,7 @@ router.post(
       owner_id: id,
       title: req.body.title || req.file.originalname,
       document_type: req.body.document_type || 'GENERAL',
-      file_path: publicPath(req.file),
+      file_path: await publicPath(req.file, 'documents'),
       file_name: req.file.originalname,
       file_size: req.file.size,
       mime_type: req.file.mimetype,

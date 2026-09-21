@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import env from '../config/env.js';
 import { badRequest } from '../lib/errors.js';
+import { remove, store } from '../lib/files.js';
 
 const ALLOWED = {
   image: ['image/jpeg', 'image/png', 'image/webp', 'image/gif'],
@@ -28,24 +29,13 @@ const EXTENSIONS = new Set([
 ]);
 
 /**
- * Files are stored with a generated name — the original name is never used on
- * disk, which removes path-traversal and executable-extension risk.
+ * Uploads are received into memory, not written straight to disk.
+ *
+ * Where a file finally belongs — the local disk or object storage — is a
+ * deployment decision, and multer cannot make it. Holding the bytes for the
+ * moment it takes to hand them to `lib/files.js` keeps that decision in one
+ * place. The size limits below are what bound the memory this costs.
  */
-function storageFor(folder) {
-  return multer.diskStorage({
-    destination(_req, _file, cb) {
-      const dir = path.join(env.uploadDir, folder);
-      fs.mkdirSync(dir, { recursive: true });
-      cb(null, dir);
-    },
-    filename(_req, file, cb) {
-      const ext = path.extname(file.originalname).toLowerCase();
-      const safeExt = EXTENSIONS.has(ext) ? ext : '.bin';
-      cb(null, `${Date.now()}-${crypto.randomBytes(8).toString('hex')}${safeExt}`);
-    },
-  });
-}
-
 function filterFor(kinds) {
   const allowed = kinds.flatMap((k) => ALLOWED[k] || []);
   return (_req, file, cb) => {
@@ -58,11 +48,15 @@ function filterFor(kinds) {
 }
 
 export function uploader(folder, kinds = ['image', 'document'], maxMb = env.maxUploadMb) {
-  return multer({
-    storage: storageFor(folder),
+  const middleware = multer({
+    storage: multer.memoryStorage(),
     fileFilter: filterFor(kinds),
     limits: { fileSize: maxMb * 1024 * 1024, files: 10 },
   });
+  // The folder travels with the uploader so call sites keep saying which kind
+  // of thing they are storing, exactly as they did before.
+  middleware.folder = folder;
+  return middleware;
 }
 
 /**
@@ -90,18 +84,13 @@ export const photoUpload = uploader('photos', ['image'], 4);
 export const documentUpload = uploader('documents', ['image', 'document']);
 export const materialUpload = uploader('materials', ['image', 'document', 'media'], 50);
 
-/** Public URL for a stored file. */
-export const publicPath = (file) =>
-  file ? `/uploads/${path.relative(env.uploadDir, file.path).split(path.sep).join('/')}` : null;
+/**
+ * Store an uploaded file and return the path to record against it.
+ *
+ * Asynchronous now, because storing may mean a request to object storage
+ * rather than a write to the disk under our feet.
+ */
+export const publicPath = (file, folder) => store(file, folder || file?.fieldname || 'misc');
 
-/** Delete a previously stored upload, guarding against escapes from uploadDir. */
-export function deleteUpload(relativeUrl) {
-  if (!relativeUrl || !relativeUrl.startsWith('/uploads/')) return false;
-  const target = path.resolve(env.uploadDir, relativeUrl.replace('/uploads/', ''));
-  if (!target.startsWith(path.resolve(env.uploadDir))) return false;
-  if (fs.existsSync(target)) {
-    fs.rmSync(target);
-    return true;
-  }
-  return false;
-}
+/** Delete a previously stored upload. */
+export const deleteUpload = (storedPath) => remove(storedPath);
