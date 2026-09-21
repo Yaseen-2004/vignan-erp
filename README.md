@@ -181,6 +181,27 @@ and checks the result, so the translation is verified without a cloud database t
 Every institutional table carries `campus_id`, so additional Vignan campuses can be onboarded
 without redesigning anything. The seed ships two campuses and three academic years.
 
+## Going live
+
+    npm run secrets -w server        generate the token secrets
+    npm run push:keys -w server      generate the notification keys
+    npm run setup:production -w server   schema, one campus, one administrator
+    npm run preflight -w server      what is not ready yet
+
+`preflight` reports the failures that do not announce themselves — a database
+that will be discarded at the next deploy, uploaded files going to a disk that
+is wiped, a placeholder left in a secret, demo pupils still present. It changes
+nothing; it reads and reports.
+
+### Links to a child's files
+
+Photographs and documents are served through links that expire. The names have
+always been unguessable, which is not the same as private: a URL travels in
+browser history, in a screenshot, in a forwarded message, and one that worked
+for ever would keep working wherever it ended up. Every link the API hands out
+now carries an expiry and a signature over it, so a leaked link stops working
+and an altered one is refused.
+
 ## Deploying
 
 The portal and the API are deployed separately, because they need different

@@ -39,6 +39,7 @@ import { describe, isCloud as isCloudDatabase } from './db/connection.js';
 import { Readable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { read as readUpload, describe as describeFiles, usingObjectStorage } from './lib/files.js';
+import { signResponseUrls, verify as verifySignature } from './lib/signed-urls.js';
 
 const app = express();
 
@@ -98,6 +99,19 @@ app.use('/api/auth', authRoutes);
 app.get('/uploads/*', async (req, res, next) => {
   try {
     const key = decodeURIComponent(req.params[0] ?? '');
+
+    // A link that has expired, been altered, or never carried a signature is
+    // refused. Unguessable names are not privacy: a URL travels, and one that
+    // worked for ever would keep working wherever it ended up.
+    if (!verifySignature(`/uploads/${key}`, req.query.e, req.query.s)) {
+      return res.status(403).json({
+        error: {
+          code: 'LINK_EXPIRED',
+          message: 'This link has expired. Open the page again to view the file.',
+        },
+      });
+    }
+
     const file = await readUpload(key);
     if (!file) return next();
 
@@ -145,7 +159,9 @@ api.use('/reports', reportRoutes);
 api.use('/system', systemRoutes);
 api.use('/imports', importRoutes);
 
-app.use('/api', api);
+// Every stored-file path leaving the API is signed on the way out. See
+// lib/signed-urls.js for why this is central rather than per-route.
+app.use('/api', signResponseUrls, api);
 
 // ------------------------------------------------------ built SPA (prod)
 const clientDist = path.resolve(env.uploadDir, '..', '..', 'web', 'dist');
