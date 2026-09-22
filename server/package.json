@@ -21,10 +21,11 @@
     "test:mongo": "node tests/mongo.test.js",
     "test:mongo:scope": "node tests/scope.mongo.test.js",
     "test:mongo:notify": "node tests/notify.mongo.test.js",
-    "test:mongo:all": "node tests/mongo.test.js && node tests/scope.mongo.test.js && node tests/notify.mongo.test.js && node tests/crud.mongo.test.js",
+    "test:mongo:all": "node tests/mongo.test.js && node tests/scope.mongo.test.js && node tests/notify.mongo.test.js && node tests/crud.mongo.test.js && node tests/populate.mongo.test.js",
     "mongo:indexes": "node src/db/mongo/sync-indexes.js",
     "push:keys": "node src/db/push-keys.mjs",
-    "test:mongo:crud": "node tests/crud.mongo.test.js"
+    "test:mongo:crud": "node tests/crud.mongo.test.js",
+    "test:mongo:populate": "node tests/populate.mongo.test.js"
   },
   "dependencies": {
     "aws4fetch": "^1.0.20",

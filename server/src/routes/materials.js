@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { all, get, run, insert, update } from '../db/connection.js';
+import { Course, CourseAssignment, CourseMaterial, Student } from '../db/mongo/models.js';
+import { plain } from '../db/mongo/query.js';
+import { oid } from '../db/mongo/connection.js';
 import { asyncHandler, ok, created } from '../lib/http.js';
 import { badRequest, notFound, forbidden } from '../lib/errors.js';
 import { requirePermission } from '../middleware/auth.js';
@@ -12,6 +14,7 @@ import { materialUpload, publicPath, deleteUpload } from '../middleware/upload.j
 import { heavyLimiter } from '../middleware/ratelimit.js';
 import { createResourceRouter } from '../lib/crud.js';
 import { logActivity } from '../lib/audit.js';
+import { sameId } from '../lib/scope.js';
 import {
   isAdmin, isTeacher, isStudent, isParent, facultyIdOf, teacherOwnsCourse, studentIdOf, childrenOf,
 } from '../lib/scope.js';
@@ -25,58 +28,78 @@ const router = Router();
  *   Student  -> published material for their own class
  *   Parent   -> published material for their children's classes
  */
+/** See the note in mentoring.js: this is what `1 = 0` said. */
+const NONE = { $expr: { $eq: [1, 0] } };
+
+/**
+ * A pupil's and a parent's view is filtered by the *course's* class, which is
+ * a field on another collection. The SQL reached it through the join; here the
+ * courses of that class are found first and the material narrowed to them.
+ */
+const coursesOfClasses = async (classIds) => {
+  const ids = classIds.map(oid).filter(Boolean);
+  if (!ids.length) return [];
+  const rows = await Course.find({ class_id: { $in: ids } }).select('_id').lean();
+  return rows.map((r) => r._id);
+};
+
 async function materialScope(req) {
   if (isAdmin(req.user) || req.user.role_code === 'ADMINISTRATOR') return null;
 
   if (isTeacher(req.user)) {
     const facultyId = await facultyIdOf(req.user);
+    if (!facultyId) return NONE;
+    // Their own material, or material for a course they are assigned to.
+    const assigned = await CourseAssignment.find({ faculty_id: oid(facultyId), status: 'ACTIVE' })
+      .select('course_id').lean();
     return {
-      clause: `(cm.faculty_id = ? OR cm.course_id IN (SELECT course_id FROM course_assignments WHERE faculty_id = ? AND status = 'ACTIVE'))`,
-      params: [facultyId ?? 0, facultyId ?? 0],
+      $or: [
+        { faculty_id: oid(facultyId) },
+        { course_id: { $in: assigned.map((a) => a.course_id).filter(Boolean) } },
+      ],
     };
   }
 
   if (isStudent(req.user)) {
-    const student = await get('SELECT class_id, section_id FROM students WHERE user_id = ?', [req.user.id]);
-    if (!student) return { clause: '1 = 0', params: [] };
+    const student = await Student.findOne({ user_id: oid(req.user.id) })
+      .select('class_id section_id').lean();
+    if (!student) return NONE;
+    const courses = await coursesOfClasses([student.class_id]);
+    if (!courses.length) return NONE;
     return {
-      clause: `cm.is_published = 1 AND co.class_id = ? AND (cm.section_id IS NULL OR cm.section_id = ?)`,
-      params: [student.class_id, student.section_id],
+      is_published: 1,
+      course_id: { $in: courses },
+      // Material for the whole class, or for this pupil's own section.
+      $or: [{ section_id: null }, { section_id: student.section_id ?? null }],
     };
   }
 
   if (isParent(req.user)) {
     const children = await childrenOf(req.user);
-    if (!children.length) return { clause: '1 = 0', params: [] };
-    const classIds = children.map((c) => c.class_id).filter(Boolean);
-    if (!classIds.length) return { clause: '1 = 0', params: [] };
-    return {
-      clause: `cm.is_published = 1 AND co.class_id IN (${classIds.map(() => '?').join(',')})`,
-      params: classIds,
-    };
+    const courses = await coursesOfClasses(children.map((c) => c.class_id).filter(Boolean));
+    if (!courses.length) return NONE;
+    return { is_published: 1, course_id: { $in: courses } };
   }
 
-  return { clause: '1 = 0', params: [] };
+  return NONE;
 }
 
 const materialsRouter = createResourceRouter({
   table: 'course_materials',
   module: 'materials',
   entityType: 'Course Material',
-  alias: 'cm',
-  select: `cm.*, co.name AS course_name, co.code AS course_code, sub.name AS subject_name,
-           u.full_name AS faculty_name, c.name AS class_name, sec.name AS section_name`,
-  joins: `JOIN courses co ON co.id = cm.course_id
-          JOIN subjects sub ON sub.id = co.subject_id
-          JOIN faculty f ON f.id = cm.faculty_id
-          JOIN users u ON u.id = f.user_id
-          LEFT JOIN classes c ON c.id = co.class_id
-          LEFT JOIN sections sec ON sec.id = cm.section_id`,
-  searchable: ['cm.title', 'cm.description', 'co.name'],
+  populate: {
+    course_id: { name: 'course_name', code: 'course_code' },
+    'course_id.subject_id': { name: 'subject_name' },
+    'course_id.class_id': { name: 'class_name' },
+    section_id: { name: 'section_name' },
+    'faculty_id.user_id': { full_name: 'faculty_name' },
+  },
+  searchable: ['title', 'description'],
   filterable: ['course_id', 'section_id', 'material_type', 'faculty_id', 'is_published'],
   sortable: ['id', 'title', 'created_at', 'due_date'],
   defaultSort: 'created_at',
-  scopeClause: materialScope,
+  scopeFilter: materialScope,
   /**
    * Material belongs to whoever uploaded it.
    *
@@ -126,23 +149,23 @@ materialsRouter.get(
   '/:id/download',
   requirePermission('materials.view'),
   asyncHandler(async (req, res) => {
-    const material = await get(
-      `SELECT cm.*, co.class_id FROM course_materials cm
-         JOIN courses co ON co.id = cm.course_id
-        WHERE cm.id = ?`,
-      [Number(req.params.id)]
-    );
-    if (!material) throw notFound('Material not found');
+    const materialId = oid(req.params.id);
+    const doc = materialId
+      ? await CourseMaterial.findById(materialId).populate('course_id', 'class_id campus_id name')
+      : null;
+    if (!doc) throw notFound('Material not found');
+    const material = { ...plain(doc), class_id: doc.course_id?.class_id ?? null };
 
-    // Re-apply the same visibility rule the listing uses.
+    /*
+     * Re-apply the visibility rule the listing uses.
+     *
+     * Asked as "does this record match both its own id and that rule?", which
+     * is what the SQL did. Checking the rule separately would be a different
+     * question, and a looser one.
+     */
     const scope = await materialScope(req);
     if (scope) {
-      const visible = await get(
-        `SELECT 1 AS ok FROM course_materials cm
-           JOIN courses co ON co.id = cm.course_id
-          WHERE cm.id = ? AND ${scope.clause}`,
-        [material.id, ...scope.params]
-      );
+      const visible = await CourseMaterial.exists({ $and: [{ _id: materialId }, scope] });
       if (!visible) throw forbidden('This material is not shared with you');
     }
 
@@ -174,8 +197,9 @@ materialsRouter.post(
   materialUpload.single('file'),
   asyncHandler(async (req, res) => {
     const schema = z.object({
-      course_id: z.coerce.number().int().positive(),
-      section_id: z.coerce.number().int().positive().optional().nullable(),
+      // An identifier is text now; the route checks it resolves.
+      course_id: z.string().min(1),
+      section_id: z.string().optional().nullable(),
       title: z.string().min(1, 'Enter a title').max(200),
       description: z.string().max(1000).optional().nullable(),
       material_type: z.enum(['NOTES', 'PDF', 'PRESENTATION', 'VIDEO', 'LINK', 'ASSIGNMENT', 'OTHER']).default('NOTES'),
@@ -199,8 +223,9 @@ materialsRouter.post(
     }
     if (!req.file && !body.external_url) throw badRequest('Attach a file or provide a link');
 
-    const course = await get('SELECT * FROM courses WHERE id = ?', [body.course_id]);
-    if (!course) throw notFound('Course not found');
+    const courseDoc = await Course.findById(oid(body.course_id));
+    if (!courseDoc) throw notFound('Course not found');
+    const course = plain(courseDoc);
 
     // Store the file, then record it. If recording fails — a missing faculty
     // member, a constraint — the stored file has nothing pointing at it and
@@ -208,11 +233,11 @@ materialsRouter.post(
     const filePath = req.file ? await publicPath(req.file, 'materials') : null;
     let id;
     try {
-      id = await insert('course_materials', {
-        campus_id: course.campus_id,
-        course_id: body.course_id,
-        section_id: body.section_id ?? null,
-        faculty_id: facultyId ?? (Number(req.body.faculty_id) || null),
+      const saved = await CourseMaterial.create({
+        campus_id: oid(course.campus_id),
+        course_id: oid(body.course_id),
+        section_id: oid(body.section_id) ?? null,
+        faculty_id: oid(facultyId ?? req.body.faculty_id),
         title: body.title,
         description: body.description,
         material_type: body.material_type,
@@ -223,6 +248,7 @@ materialsRouter.post(
         due_date: body.due_date,
         is_published: body.is_published ? 1 : 0,
       });
+      id = String(saved._id);
     } catch (error) {
       if (filePath) await deleteUpload(filePath).catch(() => {});
       throw error;
@@ -230,12 +256,11 @@ materialsRouter.post(
 
     // Tell the class a new material is available.
     if (body.is_published) {
-      const students = (await all(
-        `SELECT user_id FROM students
-          WHERE class_id = ? AND user_id IS NOT NULL AND status = 'ACTIVE'
-            ${body.section_id ? 'AND section_id = ?' : ''}`,
-        body.section_id ? [course.class_id, body.section_id] : [course.class_id]
-      )).map((s) => s.user_id);
+      const audience = { class_id: oid(course.class_id), user_id: { $ne: null }, status: 'ACTIVE' };
+      // Material for one section is announced to that section only.
+      if (body.section_id) audience.section_id = oid(body.section_id);
+      const students = (await Student.find(audience).select('user_id').lean())
+        .map((s) => String(s.user_id));
       await notifyMany(students, {
         campusId: course.campus_id,
         type: body.material_type === 'ASSIGNMENT' ? 'NEW_ASSIGNMENT' : 'NEW_MATERIAL',
@@ -257,7 +282,7 @@ materialsRouter.post(
       newValues: { course_id: body.course_id, type: body.material_type },
     });
 
-    return created(res, await get('SELECT * FROM course_materials WHERE id = ?', [id]));
+    return created(res, plain(await CourseMaterial.findById(oid(id))));
   })
 );
 
@@ -266,14 +291,15 @@ materialsRouter.delete(
   '/:id/file',
   requirePermission('materials.delete'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const material = await get('SELECT * FROM course_materials WHERE id = ?', [id]);
-    if (!material) throw notFound('Material not found');
-    if (isTeacher(req.user) && material.faculty_id !== await facultyIdOf(req.user)) {
+    const id = oid(req.params.id);
+    const doc = id ? await CourseMaterial.findById(id) : null;
+    if (!doc) throw notFound('Material not found');
+    const material = plain(doc);
+    if (isTeacher(req.user) && !sameId(material.faculty_id, await facultyIdOf(req.user))) {
       throw forbidden('You may only remove your own material');
     }
     if (material.file_path) await deleteUpload(material.file_path);
-    await update('course_materials', id, { file_path: null, file_name: null, file_size: null });
+    await CourseMaterial.updateOne({ _id: id }, { $set: { file_path: null, file_name: null, file_size: null } });
     return ok(res, { id, file_removed: true });
   })
 );

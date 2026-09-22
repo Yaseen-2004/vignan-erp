@@ -48,25 +48,80 @@ export function lift(doc, mapping) {
   if (Array.isArray(doc)) return doc.map((d) => lift(d, mapping));
 
   const out = plain(doc);
-  for (const [field, fields] of Object.entries(mapping)) {
-    const related = doc[field] && typeof doc[field] === 'object' && !(doc[field] instanceof mongoose.Types.ObjectId)
-      ? doc[field]
-      : null;
+  for (const [path, fields] of Object.entries(mapping)) {
+    /*
+     * A path may cross more than one reference. `JOIN faculty f ON ... JOIN
+     * users u ON u.id = f.user_id ... u.full_name AS mentor_name` is two hops,
+     * written here as 'mentor_id.user_id'. Following them one at a time is
+     * what the chain of joins did.
+     */
+    const steps = path.split('.');
+    let related = doc;
+    for (const step of steps) {
+      related = related?.[step];
+      if (related instanceof mongoose.Types.ObjectId) { related = null; break; }
+      if (!related || typeof related !== 'object') { related = null; break; }
+    }
+
     for (const [from, to] of Object.entries(fields)) {
       out[to] = related ? (related[from] ?? null) : null;
     }
-    // The reference goes back to being an id, as the flat row had it.
-    out[field] = related?._id ? String(related._id) : (doc[field] ? String(doc[field]) : null);
+
+    // The first step goes back to being an id, as the flat row had it.
+    const head = steps[0];
+    const first = doc[head];
+    out[head] = first && typeof first === 'object' && first._id
+      ? String(first._id)
+      : (first ? String(first) : null);
   }
   return out;
 }
 
-/** The populate specification implied by a mapping, so the two cannot drift. */
-export const populateFor = (mapping) =>
-  Object.entries(mapping).map(([path, fields]) => ({
-    path,
-    select: Object.keys(fields).join(' ') + ' _id',
-  }));
+/**
+ * The populate specification implied by a mapping, so the two cannot drift.
+ *
+ * A dotted path becomes nested populate — 'mentor_id.user_id' asks for the
+ * faculty record and, within it, the user. Mongoose wants that as a tree, and
+ * paths sharing a first step are merged into one so the same reference is not
+ * fetched twice.
+ */
+export function populateFor(mapping) {
+  const roots = new Map();
+
+  for (const [path, fields] of Object.entries(mapping)) {
+    const [head, ...rest] = path.split('.');
+    const leafSelect = `${Object.keys(fields).join(' ')} _id`;
+
+    if (!roots.has(head)) roots.set(head, { path: head, select: new Set(['_id']), children: new Map() });
+    const root = roots.get(head);
+
+    if (!rest.length) {
+      for (const f of Object.keys(fields)) root.select.add(f);
+      continue;
+    }
+
+    // The intermediate reference must itself be selected, or there is nothing
+    // to populate the next step from.
+    root.select.add(rest[0]);
+    let node = root;
+    rest.forEach((step, i) => {
+      if (!node.children.has(step)) node.children.set(step, { path: step, select: new Set(['_id']), children: new Map() });
+      node = node.children.get(step);
+      if (i === rest.length - 1) for (const f of Object.keys(fields)) node.select.add(f);
+      else node.select.add(rest[i + 1]);
+    });
+    void leafSelect;
+  }
+
+  const toSpec = (node) => {
+    const spec = { path: node.path, select: [...node.select].join(' ') };
+    const kids = [...node.children.values()].map(toSpec);
+    if (kids.length) spec.populate = kids;
+    return spec;
+  };
+
+  return [...roots.values()].map(toSpec);
+}
 
 /**
  * A page of records, with the total, matching what `paginated()` sent before.
