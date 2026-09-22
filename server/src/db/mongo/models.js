@@ -143,7 +143,7 @@ export const Department = define('Department', 'departments', {
     code: { type: String, required: true },
     name: { type: String, required: true },
     description: { type: String },
-    head_faculty_id: { type: Number },
+    head_faculty_id: { type: String },
     status: { type: String, required: true, enum: ['ACTIVE', 'INACTIVE'], default: 'ACTIVE' },
 });
 
@@ -333,7 +333,7 @@ export const Enrollment = define('Enrollment', 'enrollments', {
 export const Document = define('Document', 'documents', {
     campus_id: { type: Types.ObjectId, ref: 'Campus', required: true, index: true },
     owner_type: { type: String, required: true, enum: ['STUDENT', 'FACULTY', 'ADMINISTRATOR', 'PARENT'] },
-    owner_id: { type: Number, required: true },
+    owner_id: { type: String, required: true },
     title: { type: String, required: true },
     document_type: { type: String },
     file_path: { type: String, required: true },
@@ -939,7 +939,7 @@ export const Notification = define('Notification', 'notifications', {
     body: { type: String },
     link: { type: String },
     entity_type: { type: String },
-    entity_id: { type: Number },
+    entity_id: { type: String },
     is_read: { type: Number, required: true, default: 0 },
     read_at: { type: String },
 });
@@ -970,7 +970,7 @@ export const ActivityLog = define('ActivityLog', 'activity_logs', {
     action: { type: String, required: true },
     module: { type: String },
     entity_type: { type: String },
-    entity_id: { type: Number },
+    entity_id: { type: String },
     description: { type: String },
     old_values: { type: String },
     new_values: { type: String },

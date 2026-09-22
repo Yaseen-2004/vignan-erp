@@ -1,4 +1,5 @@
-import { insert } from '../db/connection.js';
+import { ActivityLog } from '../db/mongo/models.js';
+import { oid } from '../db/mongo/connection.js';
 
 /**
  * Write an entry to activity_logs. Never throws — an audit failure must not
@@ -18,15 +19,17 @@ export async function logActivity({
 }) {
   try {
     const actor = user || req?.user || null;
-    await insert('activity_logs', {
-      campus_id: actor?.campus_id ?? null,
-      user_id: actor?.id ?? null,
+    await ActivityLog.create({
+      campus_id: oid(actor?.campus_id) ?? null,
+      user_id: oid(actor?.id) ?? null,
       user_name: actor?.full_name ?? actor?.username ?? 'SYSTEM',
       role_code: actor?.role_code ?? null,
       action,
       module: module ?? null,
       entity_type: entityType ?? null,
-      entity_id: entityId ?? null,
+      // Kept as text: an audit entry points at a record in any collection, so
+      // there is no one reference for it to be.
+      entity_id: entityId == null ? null : String(entityId),
       description: description ?? null,
       old_values: oldValues ? JSON.stringify(oldValues) : null,
       new_values: newValues ? JSON.stringify(newValues) : null,

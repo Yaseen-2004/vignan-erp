@@ -29,7 +29,8 @@
  * it — a failed push must not fail a marks approval.
  */
 import webpush from 'web-push';
-import { all, run } from '../db/connection.js';
+import { PushSubscription } from '../db/mongo/models.js';
+import { oid } from '../db/mongo/connection.js';
 import env from '../config/env.js';
 
 export const pushConfigured = Boolean(env.vapidPublicKey && env.vapidPrivateKey);
@@ -52,10 +53,9 @@ export async function pushToUser(userId, payload) {
 
   let devices;
   try {
-    devices = await all(
-      'SELECT id, endpoint, p256dh, auth FROM push_subscriptions WHERE user_id = ?',
-      [userId]
-    );
+    devices = (await PushSubscription.find({ user_id: oid(userId) })
+      .select('endpoint p256dh auth').lean())
+      .map((d) => ({ ...d, id: d._id }));
   } catch {
     return 0;
   }
@@ -80,20 +80,18 @@ export async function pushToUser(userId, payload) {
     try {
       await webpush.sendNotification(subscription, message, { TTL: 12 * 60 * 60 });
       delivered += 1;
-      await run(
-        `UPDATE push_subscriptions
-            SET last_used_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS'), failures = 0
-          WHERE id = ?`,
-        [device.id]
+      await PushSubscription.updateOne(
+        { _id: device.id },
+        { $set: { last_used_at: new Date().toISOString(), failures: 0 } }
       ).catch(() => {});
     } catch (error) {
       // 404/410 mean the push service has retired this endpoint for good.
       const gone = error?.statusCode === 404 || error?.statusCode === 410;
       try {
         if (gone) {
-          await run('DELETE FROM push_subscriptions WHERE id = ?', [device.id]);
+          await PushSubscription.deleteOne({ _id: device.id });
         } else {
-          await run('UPDATE push_subscriptions SET failures = failures + 1 WHERE id = ?', [device.id]);
+          await PushSubscription.updateOne({ _id: device.id }, { $inc: { failures: 1 } });
         }
       } catch { /* the cleanup is not worth an error of its own */ }
     }
@@ -112,16 +110,24 @@ export async function saveSubscription(userId, subscription, userAgent) {
   // The endpoint identifies the browser. Re-subscribing on the same browser —
   // or a second person signing in on a shared device — replaces the row rather
   // than adding one, so a notification never goes to whoever used it last.
-  await run(
-    `INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, user_agent)
-     VALUES (?, ?, ?, ?, ?)
-     ON CONFLICT (endpoint) DO UPDATE
-        SET user_id = EXCLUDED.user_id,
-            p256dh = EXCLUDED.p256dh,
-            auth = EXCLUDED.auth,
-            user_agent = EXCLUDED.user_agent,
-            failures = 0`,
-    [userId, endpoint, p256dh, auth, (userAgent || '').slice(0, 250)]
+  /*
+   * Upserted on the endpoint, which is what the ON CONFLICT clause did. The
+   * behaviour this protects is the shared device: the registration moves to
+   * whoever switched it on, rather than a second row being added and the
+   * school's notifications continuing to reach whoever used it last.
+   */
+  await PushSubscription.updateOne(
+    { endpoint },
+    {
+      $set: {
+        user_id: oid(userId),
+        p256dh,
+        auth,
+        user_agent: (userAgent || '').slice(0, 250),
+        failures: 0,
+      },
+    },
+    { upsert: true }
   );
   return endpoint;
 }
@@ -129,11 +135,10 @@ export async function saveSubscription(userId, subscription, userAgent) {
 /** Forget one browser's subscription. */
 export async function removeSubscription(userId, endpoint) {
   if (!endpoint) return 0;
-  const result = await run(
-    'DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?',
-    [endpoint, userId]
-  );
-  return result.changes;
+  // Both conditions matter: one person must not be able to unsubscribe
+  // another's device by knowing its endpoint.
+  const result = await PushSubscription.deleteOne({ endpoint, user_id: oid(userId) });
+  return result.deletedCount;
 }
 
 /**
@@ -149,9 +154,15 @@ export async function removeSubscription(userId, endpoint) {
  * It is the caller's own endpoint, which their browser already holds.
  */
 export async function devicesFor(userId) {
-  return all(
-    `SELECT id, endpoint, user_agent, last_used_at, created_at
-       FROM push_subscriptions WHERE user_id = ? ORDER BY created_at DESC`,
-    [userId]
-  );
+  const rows = await PushSubscription.find({ user_id: oid(userId) })
+    .select('endpoint user_agent last_used_at created_at')
+    .sort({ created_at: -1 })
+    .lean();
+  return rows.map((r) => ({
+    id: String(r._id),
+    endpoint: r.endpoint,
+    user_agent: r.user_agent ?? null,
+    last_used_at: r.last_used_at ?? null,
+    created_at: r.created_at ?? null,
+  }));
 }

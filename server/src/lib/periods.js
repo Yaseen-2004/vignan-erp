@@ -9,7 +9,8 @@
  * database written before the per-day option, or an Admin who genuinely wants
  * one figure, both keep working without a migration.
  */
-import { get } from '../db/connection.js';
+import { SystemSetting } from '../db/mongo/models.js';
+import { oid } from '../db/mongo/connection.js';
 
 /** ISO weekday numbers, matching `timetables.day_of_week` (1 = Monday). */
 export const WEEKDAYS = [
@@ -65,10 +66,15 @@ export function isUniform(map) {
 
 /** The configured map for a campus, ready to hand to the client. */
 export async function periodsPerDay(campusId) {
-  const row = await get(
-    "SELECT value FROM system_settings WHERE key = 'periods_per_day' AND (campus_id = ? OR campus_id IS NULL) ORDER BY campus_id DESC LIMIT 1",
-    [campusId ?? null]
-  );
+  /*
+   * A campus setting wins over the school-wide default, which is what
+   * `ORDER BY campus_id DESC` achieved: a row naming this campus sorted above
+   * the one with no campus at all. Asked directly here, because sorting on a
+   * reference to express a preference reads as an accident.
+   */
+  const id = oid(campusId);
+  const row = (id && await SystemSetting.findOne({ key: 'periods_per_day', campus_id: id }).lean())
+    || await SystemSetting.findOne({ key: 'periods_per_day', campus_id: null }).lean();
   return parsePeriodsPerDay(row?.value);
 }
 

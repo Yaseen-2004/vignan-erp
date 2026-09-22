@@ -1,9 +1,29 @@
 import fs from 'node:fs';
 const plan = JSON.parse(fs.readFileSync('d:/erp/scripts/model-plan.json', 'utf8'));
 
-const field = (f) => {
+/*
+ * Four columns hold an identifier without saying which table it belongs to —
+ * an audit entry's `entity_id`, a document's `owner_id`. They were integers
+ * because every key was. An ObjectId is not, and storing one in a Number field
+ * gives NaN, so an audit trail would record that something happened to record
+ * NaN. They are strings here, which is what an ObjectId is once it leaves the
+ * database.
+ */
+const LOOSE_IDS = new Set([
+  'departments.head_faculty_id',
+  'documents.owner_id',
+  'notifications.entity_id',
+  'activity_logs.entity_id',
+]);
+
+const field = (f, table) => {
   const parts = [];
-  parts.push(f.type === 'ObjectId' ? `type: Types.ObjectId, ref: '${f.ref}'` : `type: ${f.type}`);
+  const loose = LOOSE_IDS.has(table + '.' + f.col);
+  parts.push(
+    f.type === 'ObjectId' ? `type: Types.ObjectId, ref: '${f.ref}'`
+      : loose ? 'type: String'
+        : `type: ${f.type}`
+  );
   if (f.required) parts.push('required: true');
   if (f.unique) parts.push('unique: true');
   if (f.enum) parts.push(`enum: [${f.enum.map((v) => `'${v}'`).join(', ')}]`);
@@ -79,7 +99,7 @@ const define = (name, collection, definition, indexes = []) => {
 `;
 
 const body = plan.map((t) => {
-  const fields = t.fields.map(field).join('\n');
+  const fields = t.fields.map((f) => field(f, t.table)).join('\n');
   return `/* ${t.table} */
 export const ${t.model} = define('${t.model}', '${t.table}', {
 ${fields}
