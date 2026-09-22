@@ -50,6 +50,14 @@ export const env = {
   // they are kept in object storage, which survives a redeploy; leave them and
   // they go to uploadDir above, which on most hosts does not. Any S3-compatible
   // service works: Cloudflare R2, Amazon S3, Backblaze B2, MinIO.
+  // MongoDB. Every record lives here; there is no local fallback, because a
+  // document database kept beside the server would be discarded with it.
+  mongoUrl: process.env.MONGODB_URI || process.env.MONGO_URL || '',
+  mongoDbName: process.env.MONGODB_DB || 'vignan_erp',
+  // One deployed instance among many, each holding its own pool: a large pool
+  // per instance is how a managed cluster runs out of connections.
+  mongoPoolMax: Number(process.env.MONGODB_POOL_MAX || (IS_SERVERLESS ? 5 : 20)),
+
   s3Bucket: process.env.S3_BUCKET || '',
   s3Endpoint: process.env.S3_ENDPOINT || '',
   s3Region: process.env.S3_REGION || 'auto',

@@ -66,6 +66,32 @@ export function errorHandler(error, req, res, _next) {
     return reply(req, res, 413, { error: { code: 'FILE_TOO_LARGE', message: 'The uploaded file is too large' } });
   }
 
+  // A reference pointing at nothing — what a foreign key used to refuse.
+  if (error?.code === 'MISSING_REFERENCE') {
+    return reply(req, res, 409, {
+      error: { code: 'REFERENCE_ERROR', message: `A selected reference does not exist: ${error.message}` },
+    });
+  }
+
+  // Mongoose's own validation — an enumeration, a required field, a length.
+  if (error?.name === 'ValidationError' && error?.errors) {
+    return reply(req, res, 422, {
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Please correct the highlighted fields',
+        details: Object.entries(error.errors).map(([field, e]) => ({ field, message: e.message })),
+      },
+    });
+  }
+
+  // A duplicate key, which the unique indexes raise.
+  if (error?.code === 11000) {
+    const field = Object.keys(error.keyPattern || {})[0];
+    return reply(req, res, 409, {
+      error: { code: 'DUPLICATE', message: `A record with this value already exists${field ? ` (${field})` : ''}` },
+    });
+  }
+
   const message = String(error?.message || '');
   if (message.includes('UNIQUE constraint failed')) {
     const field = message.split(':').pop()?.trim();

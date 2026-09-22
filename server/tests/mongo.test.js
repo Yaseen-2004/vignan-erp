@@ -57,13 +57,27 @@ const loaded = await User.findOne({ username: 'admin' }).populate('role_id').pop
 check('populate follows a reference', loaded?.role_id?.code === 'ADMIN' && loaded?.campus_id?.name?.startsWith('Vignan'),
   `${loaded?.role_id?.code} at ${loaded?.campus_id?.name}`);
 
-// And the gap that matters: nothing stops a reference to something absent.
-const orphan = await User.create({
-  campus_id: campus._id, role_id: new mongoose.Types.ObjectId(),   // no such role
-  username: 'orphan', email: 'o@x', password_hash: 'x', full_name: 'Orphan',
-});
-check('a reference to a missing document is ACCEPTED — the gap to close', !!orphan._id,
-  'this is what the 200 foreign keys used to prevent');
+// The gap MongoDB leaves, now closed in the schema rather than in each route.
+let refused = false;
+try {
+  await User.create({
+    campus_id: campus._id, role_id: new mongoose.Types.ObjectId(),   // no such role
+    username: 'orphan', email: 'o@x', password_hash: 'x', full_name: 'Orphan',
+  });
+} catch (e) { refused = /does not exist/.test(e.message); }
+check('a reference to a missing document is refused', refused,
+  'what the 200 foreign keys used to guarantee');
+
+// And a deletion that would strand records can be seen before it happens.
+const { dependentsOf } = await import('../src/db/mongo/integrity.js');
+const blocking = await dependentsOf('Role', role._id);
+check('what a deletion would strand can be reported', blocking.some((b) => b.collection === 'users'),
+  blocking.map((b) => `${b.count} ${b.collection}.${b.field}`).join(', '));
+
+// An identifier is presented as `id`, a string, exactly as the API always did.
+const shown = loaded.toJSON();
+check('records are still identified by a string `id`',
+  typeof shown.id === 'string' && shown._id === undefined, shown.id);
 
 await mongoose.disconnect();
 await mongod.stop();

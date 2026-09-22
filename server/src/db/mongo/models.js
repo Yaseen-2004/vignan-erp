@@ -15,6 +15,7 @@
  * Regenerate with: node scripts/generate-models.mjs
  */
 import mongoose from 'mongoose';
+import { enforceReferences } from './integrity.js';
 
 const { Schema, Types } = mongoose;
 
@@ -25,9 +26,38 @@ const options = {
 };
 
 export const models = {};
+
 const define = (name, collection, definition, indexes = []) => {
   const schema = new Schema(definition, { ...options, collection });
   for (const ix of indexes) schema.index(...ix);
+
+  /*
+   * Presented as `id`, a string, exactly as the relational API always was.
+   * That the identifier is now an ObjectId is the database's business; the
+   * portal, the tests and every stored link were written against `id`.
+   */
+  schema.set('toJSON', {
+    virtuals: true,
+    versionKey: false,
+    transform(_doc, ret) {
+      ret.id = String(ret._id);
+      delete ret._id;
+      for (const [k, v] of Object.entries(ret)) {
+        if (v instanceof Types.ObjectId) ret[k] = String(v);
+      }
+      return ret;
+    },
+  });
+  schema.set('toObject', { virtuals: true });
+
+  /*
+   * The foreign keys, kept in the schema. Both this and the transform above
+   * must be attached before the model is compiled: mongoose reads a schema
+   * once, and anything added afterwards is silently ignored — which is exactly
+   * the kind of guarantee that looks present and is not.
+   */
+  enforceReferences(schema, name);
+
   models[name] = mongoose.models[name] || mongoose.model(name, schema);
   return models[name];
 };
