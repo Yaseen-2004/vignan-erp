@@ -18,6 +18,29 @@ import {
  * edit, delete and export. Buttons only appear when the signed-in user holds
  * the matching permission — the API enforces the same rules again.
  */
+/**
+ * The singular of a list's title, for the buttons that act on one of them.
+ *
+ * `title.replace(/s$/, '')` gave "Add Classe". English has no rule that gets
+ * this right from the plural alone — "Classes" comes from "Class" and loses
+ * "es", while "Courses" comes from "Course" and loses only the "s" — so the
+ * handful that do not follow the common case are named.
+ */
+const IRREGULAR = {
+  Classes: 'Class',
+  Campuses: 'Campus',
+  Faculty: 'Faculty',
+  'Fee Structures': 'Fee Structure',
+};
+
+const singular = (title) => {
+  if (IRREGULAR[title]) return IRREGULAR[title];
+  if (title.endsWith('ies')) return `${title.slice(0, -3)}y`;
+  if (/(ss|sh|ch|x)es$/.test(title)) return title.slice(0, -2);
+  if (title.endsWith('s')) return title.slice(0, -1);
+  return title;
+};
+
 export function ResourcePage({
   title,
   subtitle,
@@ -278,7 +301,7 @@ export function ResourcePage({
             )}
             {allowCreate && (
               <Button variant="primary" icon="plus" onClick={openCreate}>
-                {createLabel || `Add ${title.replace(/s$/, '')}`}
+                {createLabel || `Add ${singular(title)}`}
               </Button>
             )}
           </>
@@ -355,7 +378,7 @@ export function ResourcePage({
           emptyAction={
             allowCreate ? (
               <Button variant="primary" icon="plus" onClick={openCreate}>
-                {createLabel || `Add ${title.replace(/s$/, '')}`}
+                {createLabel || `Add ${singular(title)}`}
               </Button>
             ) : undefined
           }
@@ -387,7 +410,7 @@ export function ResourcePage({
         open={!!editing}
         onClose={() => setEditing(null)}
         size={modalSize || (fields.length > 6 ? 'wide' : '')}
-        title={editing === 'new' ? createLabel || `Add ${title.replace(/s$/, '')}` : `Edit ${title.replace(/s$/, '')}`}
+        title={editing === 'new' ? createLabel || `Add ${singular(title)}` : `Edit ${singular(title)}`}
         subtitle={editing !== 'new' && editing ? `Record #${editing.id}` : undefined}
         footer={
           <>

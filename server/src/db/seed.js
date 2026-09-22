@@ -59,11 +59,16 @@ const LOCALITIES = [
 /** The two departments (examination boards) the school runs. */
 const BOARDS = [
   { code: 'STATE', label: 'State Board', levels: 10, sections: (level) => (level >= 5 ? ['A', 'B'] : ['A']) },
-  // The CBSE wing runs senior secondary as well, so it goes up to Class 12.
-  { code: 'CBSE', label: 'CBSE', levels: 12, sections: () => ['A'] },
+  // The CBSE wing runs to Class 7 only.
+  { code: 'CBSE', label: 'CBSE', levels: 7, sections: () => ['A'] },
 ];
 
-/** Class 11 and 12 are senior secondary and carry a stream. */
+/**
+ * A stream belongs to senior secondary, which neither wing now runs — the
+ * State ladder stops at 10 and CBSE at 7. The rule is kept rather than deleted
+ * because adding Class 11 later should bring the stream back with it, and a
+ * rule that is simply absent is one nobody remembers to restore.
+ */
 const SENIOR_LEVEL = 11;
 const streamFor = (level, board) => (board === 'CBSE' && level >= SENIOR_LEVEL ? 'Science' : null);
 const daysAgo = (n) => iso(new Date(Date.now() - n * 86400000));
