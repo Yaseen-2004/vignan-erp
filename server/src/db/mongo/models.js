@@ -229,7 +229,7 @@ export const Subject = define('Subject', 'subjects', {
 });
 
 /* courses */
-export const Cours = define('Cours', 'courses', {
+export const Course = define('Course', 'courses', {
     campus_id: { type: Types.ObjectId, ref: 'Campus', required: true, index: true },
     academic_year_id: { type: Types.ObjectId, ref: 'AcademicYear', required: true, index: true },
     subject_id: { type: Types.ObjectId, ref: 'Subject', required: true, index: true },
@@ -246,7 +246,7 @@ export const Cours = define('Cours', 'courses', {
 /* course_assignments */
 export const CourseAssignment = define('CourseAssignment', 'course_assignments', {
     campus_id: { type: Types.ObjectId, ref: 'Campus', required: true, index: true },
-    course_id: { type: Types.ObjectId, ref: 'Cours', required: true, index: true },
+    course_id: { type: Types.ObjectId, ref: 'Course', required: true, index: true },
     faculty_id: { type: Types.ObjectId, ref: 'Faculty', required: true, index: true },
     section_id: { type: Types.ObjectId, ref: 'Section', required: true, index: true },
     academic_year_id: { type: Types.ObjectId, ref: 'AcademicYear', required: true, index: true },
@@ -348,7 +348,7 @@ export const Document = define('Document', 'documents', {
 export const Attendance = define('Attendance', 'attendance', {
     campus_id: { type: Types.ObjectId, ref: 'Campus', required: true, index: true },
     student_id: { type: Types.ObjectId, ref: 'Student', required: true, index: true },
-    course_id: { type: Types.ObjectId, ref: 'Cours', index: true },
+    course_id: { type: Types.ObjectId, ref: 'Course', index: true },
     section_id: { type: Types.ObjectId, ref: 'Section', index: true },
     academic_year_id: { type: Types.ObjectId, ref: 'AcademicYear', index: true },
     attendance_date: { type: String, required: true },
@@ -405,7 +405,7 @@ export const Examination = define('Examination', 'examinations', {
 export const ExamSubject = define('ExamSubject', 'exam_subjects', {
     campus_id: { type: Types.ObjectId, ref: 'Campus', required: true, index: true },
     examination_id: { type: Types.ObjectId, ref: 'Examination', required: true, index: true },
-    course_id: { type: Types.ObjectId, ref: 'Cours', required: true, index: true },
+    course_id: { type: Types.ObjectId, ref: 'Course', required: true, index: true },
     class_id: { type: Types.ObjectId, ref: 'Class', index: true },
     exam_date: { type: String },
     start_time: { type: String },
@@ -433,7 +433,7 @@ export const Mark = define('Mark', 'marks', {
     examination_id: { type: Types.ObjectId, ref: 'Examination', required: true, index: true },
     exam_subject_id: { type: Types.ObjectId, ref: 'ExamSubject', required: true, index: true },
     student_id: { type: Types.ObjectId, ref: 'Student', required: true, index: true },
-    course_id: { type: Types.ObjectId, ref: 'Cours', required: true, index: true },
+    course_id: { type: Types.ObjectId, ref: 'Course', required: true, index: true },
     marks_obtained: { type: Number },
     max_marks: { type: Number, required: true, default: 100 },
     grade: { type: String },
@@ -473,7 +473,7 @@ export const Timetable = define('Timetable', 'timetables', {
     academic_year_id: { type: Types.ObjectId, ref: 'AcademicYear', required: true, index: true },
     class_id: { type: Types.ObjectId, ref: 'Class', required: true, index: true },
     section_id: { type: Types.ObjectId, ref: 'Section', required: true, index: true },
-    course_id: { type: Types.ObjectId, ref: 'Cours', index: true },
+    course_id: { type: Types.ObjectId, ref: 'Course', index: true },
     faculty_id: { type: Types.ObjectId, ref: 'Faculty', index: true },
     day_of_week: { type: Number, required: true },
     period: { type: Number, required: true },
@@ -485,7 +485,7 @@ export const Timetable = define('Timetable', 'timetables', {
 /* course_materials */
 export const CourseMaterial = define('CourseMaterial', 'course_materials', {
     campus_id: { type: Types.ObjectId, ref: 'Campus', required: true, index: true },
-    course_id: { type: Types.ObjectId, ref: 'Cours', required: true, index: true },
+    course_id: { type: Types.ObjectId, ref: 'Course', required: true, index: true },
     section_id: { type: Types.ObjectId, ref: 'Section', index: true },
     faculty_id: { type: Types.ObjectId, ref: 'Faculty', required: true, index: true },
     title: { type: String, required: true },
@@ -594,7 +594,7 @@ export const Income = define('Income', 'income', {
 });
 
 /* expenses */
-export const Expens = define('Expens', 'expenses', {
+export const Expense = define('Expense', 'expenses', {
     campus_id: { type: Types.ObjectId, ref: 'Campus', required: true, index: true },
     category: { type: String, required: true },
     title: { type: String, required: true },
@@ -832,7 +832,7 @@ export const InventoryItem = define('InventoryItem', 'inventory_items', {
 });
 
 /* purchases */
-export const Purchas = define('Purchas', 'purchases', {
+export const Purchase = define('Purchase', 'purchases', {
     campus_id: { type: Types.ObjectId, ref: 'Campus', required: true, index: true },
     purchase_order: { type: String },
     item_id: { type: Types.ObjectId, ref: 'InventoryItem', index: true },

@@ -27,12 +27,31 @@ const TYPES = {
   REAL: 'Number', 'DOUBLE PRECISION': 'Number', TEXT: 'String', BOOLEAN: 'Boolean',
 };
 
+/*
+ * The singular of a table name.
+ *
+ * `-ses` has no rule that works: `campuses` comes from `campus` and loses
+ * `es`, while `courses` comes from `course` and loses only the `s`. English
+ * does not say which from the plural alone, and guessing produced a model
+ * called `Cours` that failed to import — obvious once it broke, invisible
+ * until then. There are five such tables in this schema, so they are named.
+ */
+const IRREGULAR = {
+  campuses: 'campus',
+  classes: 'class',
+  courses: 'course',
+  expenses: 'expense',
+  purchases: 'purchase',
+};
+
 const singular = (t) => {
+  if (IRREGULAR[t]) return IRREGULAR[t];
   if (t.endsWith('ies')) return t.slice(0, -3) + 'y';
-  if (t.endsWith('sses') || t.endsWith('ses') || t.endsWith('xes') || t.endsWith('ches')) return t.slice(0, -2);
+  if (t.endsWith('xes') || t.endsWith('ches') || t.endsWith('shes')) return t.slice(0, -2);
   if (t.endsWith('s')) return t.slice(0, -1);
   return t;
 };
+
 const pascal = (t) => singular(t).split('_').map((p) => p[0].toUpperCase() + p.slice(1)).join('');
 
 const tables = [];

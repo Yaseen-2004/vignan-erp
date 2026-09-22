@@ -747,7 +747,7 @@
  },
  {
   "table": "courses",
-  "model": "Cours",
+  "model": "Course",
   "fields": [
    {
     "col": "campus_id",
@@ -835,7 +835,7 @@
     "col": "course_id",
     "type": "ObjectId",
     "required": true,
-    "ref": "Cours"
+    "ref": "Course"
    },
    {
     "col": "faculty_id",
@@ -1302,7 +1302,7 @@
    {
     "col": "course_id",
     "type": "ObjectId",
-    "ref": "Cours"
+    "ref": "Course"
    },
    {
     "col": "section_id",
@@ -1581,7 +1581,7 @@
     "col": "course_id",
     "type": "ObjectId",
     "required": true,
-    "ref": "Cours"
+    "ref": "Course"
    },
    {
     "col": "class_id",
@@ -1700,7 +1700,7 @@
     "col": "course_id",
     "type": "ObjectId",
     "required": true,
-    "ref": "Cours"
+    "ref": "Course"
    },
    {
     "col": "marks_obtained",
@@ -1885,7 +1885,7 @@
    {
     "col": "course_id",
     "type": "ObjectId",
-    "ref": "Cours"
+    "ref": "Course"
    },
    {
     "col": "faculty_id",
@@ -1935,7 +1935,7 @@
     "col": "course_id",
     "type": "ObjectId",
     "required": true,
-    "ref": "Cours"
+    "ref": "Course"
    },
    {
     "col": "section_id",
@@ -2445,7 +2445,7 @@
  },
  {
   "table": "expenses",
-  "model": "Expens",
+  "model": "Expense",
   "fields": [
    {
     "col": "campus_id",
@@ -3522,7 +3522,7 @@
  },
  {
   "table": "purchases",
-  "model": "Purchas",
+  "model": "Purchase",
   "fields": [
    {
     "col": "campus_id",

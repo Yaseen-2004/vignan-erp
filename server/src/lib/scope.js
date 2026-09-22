@@ -8,10 +8,28 @@
  *   Student A cannot access Student B
  *   Parent A cannot access Parent B's child
  *   Teacher A cannot edit Teacher B's course or students
+ *
+ * Ported to MongoDB. Two things needed real care rather than translation.
+ *
+ * Identifiers are no longer numbers. `allowed.includes(Number(id))` was the
+ * shape of every gate here, and against ObjectIds `Number()` yields NaN, which
+ * matches nothing — every check would have failed closed, which is safe, and
+ * the portal would have shown a teacher an empty school. So ids are compared
+ * as strings, in one place, through `sameId`.
+ *
+ * And a scope was a SQL fragment; it is now a filter object. The callers'
+ * meaning is preserved exactly, including the important case: a user entitled
+ * to nothing gets a filter that matches nothing, never an absent filter that
+ * would match everything.
  */
-import { get, all } from '../db/connection.js';
 import { forbidden, notFound } from './errors.js';
 import { ROLES } from './permissions.js';
+import { oid } from '../db/mongo/connection.js';
+import { plain, lift } from '../db/mongo/query.js';
+import {
+  Administrator, Class, Course, CourseAssignment, Faculty, Parent,
+  Section, Student, StudentParent,
+} from '../db/mongo/models.js';
 
 export const isAdmin = (user) => user?.role_code === ROLES.ADMIN;
 export const isAdministrator = (user) => user?.role_code === ROLES.ADMINISTRATOR;
@@ -22,6 +40,19 @@ export const isParent = (user) => user?.role_code === ROLES.PARENT;
 /** Staff = anyone who works at the institution (as opposed to student/parent). */
 export const isStaff = (user) =>
   [ROLES.ADMIN, ROLES.ADMINISTRATOR, ROLES.TEACHING_STAFF, ROLES.FINANCIAL_STAFF].includes(user?.role_code);
+
+/**
+ * Do these two identifiers denote the same record?
+ *
+ * An id arrives as a string from a URL, as an ObjectId from a document, and as
+ * a string again from anything already serialised. Comparing them with === is
+ * wrong for two of those three, and wrong in the direction that grants nothing
+ * — so it is done here, once, and nowhere else.
+ */
+export const sameId = (a, b) => a != null && b != null && String(a) === String(b);
+
+/** The same, against a list. */
+const listHas = (list, id) => list.some((x) => sameId(x, id));
 
 // ------------------------------------------------------- department (board)
 
@@ -39,21 +70,21 @@ export const isStaff = (user) =>
 export async function boardOf(user) {
   if (!user || isAdmin(user)) return null;
 
-  const table = isAdministrator(user) ? 'administrators' : isStaff(user) ? 'faculty' : null;
-  if (!table) return null;
+  const Model = isAdministrator(user) ? Administrator : isStaff(user) ? Faculty : null;
+  if (!Model) return null;
 
-  const row = await get(`SELECT board FROM ${table} WHERE user_id = ?`, [user.id]);
+  const row = await Model.findOne({ user_id: oid(user.id) }).select('board').lean();
   const board = row?.board;
   return board && board !== 'BOTH' ? board : null;
 }
 
 /**
- * A WHERE fragment confining a query to the user's department, or null when
- * they are unrestricted. `column` must already be qualified for the query.
+ * A filter confining a query to the user's department, or null when they are
+ * unrestricted. Merged into a query with the other conditions.
  */
-export async function boardClause(user, column = 'board') {
+export async function boardClause(user, field = 'board') {
   const board = await boardOf(user);
-  return board ? { clause: `${column} = ?`, params: [board] } : null;
+  return board ? { [field]: board } : null;
 }
 
 /** Refuse a write that would put a record in a department the user cannot reach. */
@@ -64,77 +95,75 @@ export async function assertBoardAccess(user, board) {
 }
 
 // ------------------------------------------------------------- profiles
-export async function studentIdOf(user) {
-  const row = await get('SELECT id FROM students WHERE user_id = ?', [user.id]);
-  return row?.id ?? null;
-}
+const idOfProfile = async (Model, user) => {
+  const row = await Model.findOne({ user_id: oid(user?.id) }).select('_id').lean();
+  return row ? String(row._id) : null;
+};
 
-export async function parentIdOf(user) {
-  const row = await get('SELECT id FROM parents WHERE user_id = ?', [user.id]);
-  return row?.id ?? null;
-}
-
-export async function facultyIdOf(user) {
-  const row = await get('SELECT id FROM faculty WHERE user_id = ?', [user.id]);
-  return row?.id ?? null;
-}
+export const studentIdOf = (user) => idOfProfile(Student, user);
+export const parentIdOf = (user) => idOfProfile(Parent, user);
+export const facultyIdOf = (user) => idOfProfile(Faculty, user);
 
 // -------------------------------------------------------------- parents
 /** Children linked to a parent user. */
 export async function childrenOf(user) {
   const parentId = await parentIdOf(user);
   if (!parentId) return [];
-  return await all(
-    `SELECT s.id, s.admission_number, s.roll_number, s.first_name, s.last_name, s.photo,
-            s.class_id, s.section_id, s.status, s.campus_id,
-            c.name AS class_name, sec.name AS section_name, sp.relation
-       FROM student_parents sp
-       JOIN students s ON s.id = sp.student_id
-       LEFT JOIN classes c ON c.id = s.class_id
-       LEFT JOIN sections sec ON sec.id = s.section_id
-      WHERE sp.parent_id = ?
-      ORDER BY s.first_name`,
-    [parentId]
-  );
+
+  const links = await StudentParent.find({ parent_id: oid(parentId) })
+    .populate({
+      path: 'student_id',
+      populate: [{ path: 'class_id', select: 'name' }, { path: 'section_id', select: 'name' }],
+    });
+
+  return links
+    .filter((l) => l.student_id)
+    .map((l) => {
+      const s = lift(l.student_id, {
+        class_id: { name: 'class_name' },
+        section_id: { name: 'section_name' },
+      });
+      // `relation` came from the link, not the pupil — it says how this adult
+      // is related to this child, which differs per link.
+      return { ...s, relation: l.relation };
+    })
+    .sort((a, b) => String(a.first_name || '').localeCompare(String(b.first_name || '')));
 }
 
 export async function parentOwnsStudent(user, studentId) {
   const parentId = await parentIdOf(user);
   if (!parentId) return false;
-  return !!await get('SELECT 1 AS ok FROM student_parents WHERE parent_id = ? AND student_id = ?', [parentId, studentId]);
+  const sid = oid(studentId);
+  if (!sid) return false;
+  return !!await StudentParent.exists({ parent_id: oid(parentId), student_id: sid });
 }
 
 // ------------------------------------------------------------- teachers
+const activeAssignments = async (facultyId, select) =>
+  CourseAssignment.find({ faculty_id: oid(facultyId), status: 'ACTIVE' }).select(select).lean();
+
 /** Course ids a teacher is assigned to. */
 export async function teacherCourseIds(user) {
   const facultyId = await facultyIdOf(user);
   if (!facultyId) return [];
-  return (await all(
-    `SELECT DISTINCT course_id FROM course_assignments WHERE faculty_id = ? AND status = 'ACTIVE'`,
-    [facultyId]
-  )).map((r) => r.course_id);
+  const rows = await activeAssignments(facultyId, 'course_id');
+  return [...new Set(rows.map((r) => String(r.course_id)).filter((x) => x !== 'null'))];
 }
 
 /** Section ids a teacher teaches (their classes). */
 export async function teacherSectionIds(user) {
   const facultyId = await facultyIdOf(user);
   if (!facultyId) return [];
-  return (await all(
-    `SELECT DISTINCT section_id FROM course_assignments WHERE faculty_id = ? AND status = 'ACTIVE'`,
-    [facultyId]
-  )).map((r) => r.section_id);
+  const rows = await activeAssignments(facultyId, 'section_id');
+  return [...new Set(rows.map((r) => r.section_id).filter(Boolean).map(String))];
 }
 
 export async function teacherOwnsCourse(user, courseId, sectionId = null) {
   const facultyId = await facultyIdOf(user);
   if (!facultyId) return false;
-  const params = [facultyId, courseId];
-  let sql = `SELECT 1 AS ok FROM course_assignments WHERE faculty_id = ? AND course_id = ? AND status = 'ACTIVE'`;
-  if (sectionId) {
-    sql += ' AND section_id = ?';
-    params.push(sectionId);
-  }
-  return !!await get(sql, params);
+  const filter = { faculty_id: oid(facultyId), course_id: oid(courseId), status: 'ACTIVE' };
+  if (sectionId) filter.section_id = oid(sectionId);
+  return !!await CourseAssignment.exists(filter);
 }
 
 /**
@@ -143,21 +172,31 @@ export async function teacherOwnsCourse(user, courseId, sectionId = null) {
  * A class teacher (or section teacher) owns the whole section: every subject,
  * every record. A subject teacher only ever sees their own subject's data for
  * the same students.
+ *
+ * The SQL was a UNION of two questions — sections they teach directly, and
+ * sections of classes they lead. Both are asked here and the answers merged,
+ * which is what a UNION did.
  */
 export async function classTeacherSectionIds(user) {
   const facultyId = await facultyIdOf(user);
   if (!facultyId) return [];
-  return (await all(
-    `SELECT s.id FROM sections s WHERE s.section_teacher_id = ?
-      UNION
-     SELECT s.id FROM sections s JOIN classes c ON c.id = s.class_id WHERE c.class_teacher_id = ?`,
-    [facultyId, facultyId]
-  )).map((r) => r.id);
+  const fid = oid(facultyId);
+
+  const [direct, viaClass] = await Promise.all([
+    Section.find({ section_teacher_id: fid }).select('_id').lean(),
+    Class.find({ class_teacher_id: fid }).select('_id').lean(),
+  ]);
+
+  const sectionsOfThoseClasses = viaClass.length
+    ? await Section.find({ class_id: { $in: viaClass.map((c) => c._id) } }).select('_id').lean()
+    : [];
+
+  return [...new Set([...direct, ...sectionsOfThoseClasses].map((s) => String(s._id)))];
 }
 
 export async function isClassTeacherOfSection(user, sectionId) {
   if (!isTeacher(user) || !sectionId) return false;
-  return (await classTeacherSectionIds(user)).includes(Number(sectionId));
+  return listHas(await classTeacherSectionIds(user), sectionId);
 }
 
 /**
@@ -173,8 +212,8 @@ export async function hasFullStudentAccess(user, student) {
   if (isStudent(user) || isParent(user)) return true;
   if (isTeacher(user)) {
     const facultyId = await facultyIdOf(user);
-    if (facultyId && student.mentor_id === facultyId) return true;
-    return (await classTeacherSectionIds(user)).includes(student.section_id);
+    if (facultyId && sameId(student.mentor_id, facultyId)) return true;
+    return listHas(await classTeacherSectionIds(user), student.section_id);
   }
   return false;
 }
@@ -184,25 +223,28 @@ export async function hasFullStudentAccess(user, student) {
  *
  * Three routes in: the sections they teach a course to, the section they are
  * class teacher of (which they own even without a course there), and their
- * own mentees.
+ * own mentees. The SQL asked all three as a UNION; they are asked separately
+ * here and merged, which is the same question.
  */
 export async function teacherStudentIds(user) {
   const facultyId = await facultyIdOf(user);
   if (!facultyId) return [];
-  return (await all(
-    `SELECT DISTINCT s.id
-       FROM students s
-       JOIN course_assignments ca ON ca.section_id = s.section_id
-      WHERE ca.faculty_id = ? AND ca.status = 'ACTIVE' AND s.status = 'ACTIVE'
-      UNION
-     SELECT s.id FROM students s
-       JOIN sections sec ON sec.id = s.section_id
-       JOIN classes c ON c.id = sec.class_id
-      WHERE (sec.section_teacher_id = ? OR c.class_teacher_id = ?) AND s.status = 'ACTIVE'
-      UNION
-     SELECT id FROM students WHERE mentor_id = ? AND status = 'ACTIVE'`,
-    [facultyId, facultyId, facultyId, facultyId]
-  )).map((r) => r.id);
+  const fid = oid(facultyId);
+
+  const [taughtSections, ownedSections] = await Promise.all([
+    teacherSectionIds(user),
+    classTeacherSectionIds(user),
+  ]);
+  const sectionIds = [...new Set([...taughtSections, ...ownedSections])].map(oid).filter(Boolean);
+
+  const [bySection, mentees] = await Promise.all([
+    sectionIds.length
+      ? Student.find({ section_id: { $in: sectionIds }, status: 'ACTIVE' }).select('_id').lean()
+      : [],
+    Student.find({ mentor_id: fid, status: 'ACTIVE' }).select('_id').lean(),
+  ]);
+
+  return [...new Set([...bySection, ...mentees].map((s) => String(s._id)))];
 }
 
 // -------------------------------------------------- unified student gate
@@ -221,7 +263,8 @@ export async function accessibleStudentIds(user) {
   // every one of them when they are assigned to BOTH.
   if (isAdministrator(user) || isFinancial(user)) {
     if (!board) return null;
-    return (await all("SELECT id FROM students WHERE board = ?", [board])).map((row) => row.id);
+    const rows = await Student.find({ board }).select('_id').lean();
+    return rows.map((r) => String(r._id));
   }
 
   // A teacher is scoped by what they are assigned, not by a department label:
@@ -229,7 +272,7 @@ export async function accessibleStudentIds(user) {
   // voiding it here would take away access the office deliberately granted.
   if (isTeacher(user)) return await teacherStudentIds(user);
 
-  if (isParent(user)) return (await childrenOf(user)).map((c) => c.id);
+  if (isParent(user)) return (await childrenOf(user)).map((c) => String(c.id));
   if (isStudent(user)) {
     const id = await studentIdOf(user);
     return id ? [id] : [];
@@ -238,17 +281,18 @@ export async function accessibleStudentIds(user) {
 }
 
 export async function canAccessStudent(user, studentId) {
-  const id = Number(studentId);
-  if (!id) return false;
+  if (!studentId) return false;
   const allowed = await accessibleStudentIds(user);
   if (allowed === null) return true;
-  return allowed.includes(id);
+  return listHas(allowed, studentId);
 }
 
-/** Throw unless the caller may read this student; returns the student row. */
+/** Throw unless the caller may read this student; returns the student record. */
 export async function assertStudentAccess(user, studentId) {
-  const student = await get('SELECT * FROM students WHERE id = ?', [Number(studentId)]);
-  if (!student) throw notFound('Student not found');
+  const id = oid(studentId);
+  const doc = id ? await Student.findById(id) : null;
+  if (!doc) throw notFound('Student not found');
+  const student = plain(doc);
   if (!await canAccessStudent(user, student.id)) {
     throw forbidden('You are not authorised to access this student record');
   }
@@ -257,8 +301,10 @@ export async function assertStudentAccess(user, studentId) {
 
 /** Throw unless the caller may write to this course. */
 export async function assertCourseAccess(user, courseId, sectionId = null) {
-  const course = await get('SELECT * FROM courses WHERE id = ?', [Number(courseId)]);
-  if (!course) throw notFound('Course not found');
+  const id = oid(courseId);
+  const doc = id ? await Course.findById(id) : null;
+  if (!doc) throw notFound('Course not found');
+  const course = plain(doc);
   if (isAdmin(user) || isAdministrator(user)) return course;
   if (isTeacher(user) && await teacherOwnsCourse(user, course.id, sectionId)) return course;
   throw forbidden('This course is not assigned to you');
@@ -267,19 +313,37 @@ export async function assertCourseAccess(user, courseId, sectionId = null) {
 /** Staff may only act inside their own campus (Admin may cross campuses). */
 export function assertSameCampus(user, campusId) {
   if (isAdmin(user)) return true;
-  if (campusId && user.campus_id && Number(campusId) !== Number(user.campus_id)) {
+  if (campusId && user.campus_id && !sameId(campusId, user.campus_id)) {
     throw forbidden('This record belongs to a different campus');
   }
   return true;
 }
 
 /**
- * Build a `WHERE ... IN (...)` fragment for a student-scoped query.
- * Returns { clause, params } where clause is '' when unrestricted.
+ * A filter confining a query to the students this user may read.
+ *
+ * `{}` means unrestricted. The middle case is the one that matters: a user
+ * entitled to no pupils at all must get a filter that matches nothing. The SQL
+ * said `AND 1 = 0` for exactly that reason, and an empty `$in` does the same
+ * here — an absent filter would quietly show them the whole school.
  */
-export async function studentScopeClause(user, column = 'student_id') {
+export async function studentScopeClause(user, field = 'student_id') {
   const allowed = await accessibleStudentIds(user);
-  if (allowed === null) return { clause: '', params: [] };
-  if (!allowed.length) return { clause: ` AND 1 = 0`, params: [] };
-  return { clause: ` AND ${column} IN (${allowed.map(() => '?').join(',')})`, params: allowed };
+  if (allowed === null) return {};
+
+  /*
+   * Entitled to nothing must mean nothing.
+   *
+   * The obvious `{ [field]: { $in: [] } }` is not safe here. Mongoose runs with
+   * strictQuery, which drops conditions on paths a collection does not have —
+   * so a filter naming the wrong field does not narrow the query, it vanishes,
+   * and "this person may see no pupils" becomes "show them the whole school".
+   * Failing open, silently, from a typo.
+   *
+   * `$expr` is not a path, so nothing can strip it. It is what the SQL said:
+   * AND 1 = 0.
+   */
+  if (!allowed.length) return { $expr: { $eq: [1, 0] } };
+
+  return { [field]: { $in: allowed.map(oid).filter(Boolean) } };
 }

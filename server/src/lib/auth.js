@@ -1,17 +1,29 @@
+/**
+ * Who someone is, and what they may do.
+ *
+ * Ported to MongoDB. What each function *returns* is deliberately unchanged:
+ * `loadUser` still hands back a flat record carrying `role_code` and
+ * `campus_name` beside the user's own fields, because that is what the join
+ * produced and what everything downstream — `publicUser`, the permission
+ * middleware, the portal — reads. The query underneath is a populate; the
+ * shape it yields is not allowed to differ.
+ */
+import crypto from 'node:crypto';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import crypto from 'node:crypto';
 import env from '../config/env.js';
-import { get, all, run } from '../db/connection.js';
+import { Administrator, Faculty, Parent, RefreshToken, RolePermission, Student, User, UserPermission } from '../db/mongo/models.js';
+import { insensitive, lift, plain } from '../db/mongo/query.js';
+import { oid } from '../db/mongo/connection.js';
 import { ROLE_HOME } from './permissions.js';
 import { boardOf } from './scope.js';
 
-export const hashPassword = (plain) => bcrypt.hash(plain, env.bcryptRounds);
-export const verifyPassword = (plain, hash) => bcrypt.compare(plain, hash);
+export const hashPassword = (plainText) => bcrypt.hash(plainText, env.bcryptRounds);
+export const verifyPassword = (plainText, hash) => bcrypt.compare(plainText, hash);
 
 export function signAccessToken(user) {
   return jwt.sign(
-    { sub: user.id, role: user.role_code, campus: user.campus_id, name: user.full_name },
+    { sub: String(user.id), role: user.role_code },
     env.jwtSecret,
     { expiresIn: env.accessTokenTtl, issuer: 'vignan-erp' }
   );
@@ -23,116 +35,139 @@ export function verifyAccessToken(token) {
 
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex');
 
+/*
+ * Expiry is stored as an ISO instant, and compared as a string.
+ *
+ * That works only because every one of them is written by the line below, in
+ * the same format and the same zone — ISO 8601 in UTC sorts the same way as the
+ * instants it denotes. A single value written in another format would compare
+ * wrongly and silently, so nothing else may write this field.
+ */
+const nowIso = () => new Date().toISOString();
+
 export async function issueRefreshToken(userId, req) {
   const token = crypto.randomBytes(48).toString('hex');
   const expiresAt = new Date(Date.now() + env.refreshTokenTtlDays * 86400000).toISOString();
-  await run(
-    `INSERT INTO refresh_tokens (user_id, token_hash, user_agent, ip_address, expires_at)
-     VALUES (?, ?, ?, ?, ?)`,
-    [userId, sha256(token), req?.get?.('user-agent') || null, req?.ip || null, expiresAt]
-  );
+  await RefreshToken.create({
+    user_id: oid(userId),
+    token_hash: sha256(token),
+    user_agent: req?.get?.('user-agent') || null,
+    ip_address: req?.ip || null,
+    expires_at: expiresAt,
+  });
   return { token, expiresAt };
 }
 
 export async function consumeRefreshToken(token) {
   if (!token) return null;
-  const row = await get(
-    `SELECT * FROM refresh_tokens
-      WHERE token_hash = ? AND revoked_at IS NULL AND expires_at::timestamptz > now()`,
-    [sha256(token)]
+
+  /*
+   * Found and revoked in one operation.
+   *
+   * A refresh token is single use. Reading it, then revoking it in a second
+   * call, leaves a gap in which two requests can both find it valid and both
+   * be issued a session — which is precisely the replay that rotating tokens
+   * exists to prevent. `findOneAndUpdate` makes the pair atomic, and only the
+   * request that actually changed the row gets a session.
+   */
+  const row = await RefreshToken.findOneAndUpdate(
+    { token_hash: sha256(token), revoked_at: null, expires_at: { $gt: nowIso() } },
+    { $set: { revoked_at: nowIso() } },
+    { new: false }
   );
-  if (!row) return null;
-  // Rotate: a refresh token is single-use.
-  await run("UPDATE refresh_tokens SET revoked_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?", [row.id]);
-  return row;
+  return row ? plain(row) : null;
 }
 
 export async function revokeRefreshToken(token) {
   if (!token) return 0;
-  return (await run("UPDATE refresh_tokens SET revoked_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS') WHERE token_hash = ?", [sha256(token)])).changes;
+  const result = await RefreshToken.updateOne(
+    { token_hash: sha256(token), revoked_at: null },
+    { $set: { revoked_at: nowIso() } }
+  );
+  return result.modifiedCount;
 }
 
 export async function revokeAllUserTokens(userId) {
-  return (await run("UPDATE refresh_tokens SET revoked_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS') WHERE user_id = ? AND revoked_at IS NULL", [
-    userId,
-  ])).changes;
+  const result = await RefreshToken.updateMany(
+    { user_id: oid(userId), revoked_at: null },
+    { $set: { revoked_at: nowIso() } }
+  );
+  return result.modifiedCount;
 }
 
-/** Full user record joined with its role. */
+/** The fields the old join lifted out of roles and campuses. */
+const USER_JOIN = {
+  role_id: { code: 'role_code', name: 'role_name', level: 'role_level' },
+  campus_id: { name: 'campus_name', code: 'campus_code' },
+};
+
+/** Full user record with its role, in the shape the join returned. */
 export async function loadUser(userId) {
-  return await get(
-    `SELECT u.*, r.code AS role_code, r.name AS role_name, r.level AS role_level,
-            c.name AS campus_name, c.code AS campus_code
-       FROM users u
-       JOIN roles r ON r.id = u.role_id
-       LEFT JOIN campuses c ON c.id = u.campus_id
-      WHERE u.id = ?`,
-    [userId]
-  );
+  const _id = oid(userId);
+  if (!_id) return null;
+  const doc = await User.findById(_id).populate('role_id').populate('campus_id');
+  return doc ? lift(doc, USER_JOIN) : null;
 }
 
 export async function findUserByLogin(login) {
-  return await get(
-    `SELECT u.*, r.code AS role_code, r.name AS role_name, r.level AS role_level
-       FROM users u JOIN roles r ON r.id = u.role_id
-      WHERE lower(u.username) = lower(?) OR lower(u.email) = lower(?)`,
-    [login, login]
-  );
+  const pattern = insensitive(login);
+  const doc = await User.findOne({ $or: [{ username: pattern }, { email: pattern }] })
+    .populate('role_id')
+    .populate('campus_id');
+  return doc ? lift(doc, USER_JOIN) : null;
 }
 
 /**
- * Effective permissions = role grants + per-user ALLOW overrides - per-user DENY overrides.
- * Read fresh from the database on every request so permission changes take effect at once.
+ * Effective permissions = role grants + per-user ALLOW - per-user DENY.
+ * Read fresh on every request, so a permission change takes effect at once.
  */
 export async function effectivePermissions(user) {
-  const rolePerms = (await all(
-    `SELECT p.code FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id WHERE rp.role_id = ?`,
-    [user.role_id]
-  )).map((r) => r.code);
+  const [rolePerms, overrides] = await Promise.all([
+    RolePermission.find({ role_id: oid(user.role_id) }).populate('permission_id', 'code'),
+    UserPermission.find({ user_id: oid(user.id) }).populate('permission_id', 'code'),
+  ]);
 
-  const overrides = await all(
-    `SELECT p.code, up.effect FROM user_permissions up JOIN permissions p ON p.id = up.permission_id WHERE up.user_id = ?`,
-    [user.id]
-  );
-
-  const set = new Set(rolePerms);
+  const set = new Set(rolePerms.map((rp) => rp.permission_id?.code).filter(Boolean));
   for (const o of overrides) {
-    if (o.effect === 'ALLOW') set.add(o.code);
-    else set.delete(o.code);
+    const code = o.permission_id?.code;
+    if (!code) continue;
+    if (o.effect === 'ALLOW') set.add(code);
+    else set.delete(code);
   }
   return set;
 }
 
-/** The profile row (student / faculty / parent / administrator) attached to a user. */
+/** The profile record attached to a user, by what kind of person they are. */
 export async function loadProfile(user) {
+  const userId = oid(user.id);
+  if (!userId) return null;
+
   switch (user.role_code) {
-    case 'STUDENT':
-      return await get(
-        `SELECT s.*, c.name AS class_name, sec.name AS section_name, ay.name AS academic_year
-           FROM students s
-           LEFT JOIN classes c ON c.id = s.class_id
-           LEFT JOIN sections sec ON sec.id = s.section_id
-           LEFT JOIN academic_years ay ON ay.id = s.academic_year_id
-          WHERE s.user_id = ?`,
-        [user.id]
-      );
-    case 'PARENT':
-      return await get('SELECT * FROM parents WHERE user_id = ?', [user.id]);
+    case 'STUDENT': {
+      const mapping = {
+        class_id: { name: 'class_name' },
+        section_id: { name: 'section_name' },
+        academic_year_id: { name: 'academic_year' },
+      };
+      const doc = await Student.findOne({ user_id: userId })
+        .populate('class_id', 'name')
+        .populate('section_id', 'name')
+        .populate('academic_year_id', 'name');
+      return doc ? lift(doc, mapping) : null;
+    }
+    case 'PARENT': {
+      const doc = await Parent.findOne({ user_id: userId });
+      return doc ? plain(doc) : null;
+    }
     case 'TEACHING_STAFF':
-    case 'FINANCIAL_STAFF':
-      return await get(
-        `SELECT f.*, d.name AS department_name
-           FROM faculty f LEFT JOIN departments d ON d.id = f.department_id
-          WHERE f.user_id = ?`,
-        [user.id]
-      );
-    case 'ADMINISTRATOR':
-      return await get(
-        `SELECT a.*, d.name AS department_name
-           FROM administrators a LEFT JOIN departments d ON d.id = a.department_id
-          WHERE a.user_id = ?`,
-        [user.id]
-      );
+    case 'FINANCIAL_STAFF': {
+      const doc = await Faculty.findOne({ user_id: userId }).populate('department_id', 'name');
+      return doc ? lift(doc, { department_id: { name: 'department_name' } }) : null;
+    }
+    case 'ADMINISTRATOR': {
+      const doc = await Administrator.findOne({ user_id: userId }).populate('department_id', 'name');
+      return doc ? lift(doc, { department_id: { name: 'department_name' } }) : null;
+    }
     default:
       return null;
   }
