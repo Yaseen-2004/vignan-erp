@@ -209,7 +209,21 @@ things. The portal is static files and belongs on a CDN; the API is a Node
 server that writes uploaded files to disk and holds connections to PostgreSQL,
 and belongs on a host that provides both.
 
-### Both halves on Vercel
+### The arrangement these files describe
+
+The API on Render, the portal on Vercel. They are separate services on separate
+hosts, which is why three settings exist that a combined deployment does not
+need: `VITE_API_URL` tells the portal where the API is, `CORS_ORIGINS` tells the
+API which site may call it, and `COOKIE_SAMESITE=none` lets the session cookie
+travel between them. Miss the last one and signing in appears to work, then
+forgets itself on the next page load.
+
+`.vercelignore` keeps Vercel from deploying the API as well. Vercel treats any
+file under `api/` as a function whether or not `vercel.json` mentions it, and
+two APIs answering the same portal — one of them with no database — is worse
+than either alone.
+
+### Both halves on Vercel, instead
 
 Import the repository and Vercel reads `vercel.json`: it builds the web
 workspace, publishes `web/dist`, and runs the Express API as a function under

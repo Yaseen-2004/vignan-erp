@@ -2,43 +2,28 @@
   "$schema": "https://openapi.vercel.sh/vercel.json",
 
   "//": [
-    "Both halves of the portal deploy here: the React application as static",
-    "files, and the Express API as a serverless function under api/.",
+    "The portal only. The API runs on Render — see render.yaml — and this site",
+    "is told where to find it by VITE_API_URL at build time.",
     "",
-    "Because they share an origin, the API needs no CORS entry and the session",
-    "cookie stays SameSite=lax — neither VITE_API_URL nor COOKIE_SAMESITE is",
-    "wanted in this arrangement. They exist for hosting the two apart.",
+    "The API is deliberately not deployed here. `api/index.mjs` exists so the",
+    "whole thing *can* run on Vercel instead, and .vercelignore keeps Vercel",
+    "from picking it up in this arrangement: two APIs answering the same",
+    "portal, one of them without a database, is worse than either alone.",
+    "",
+    "Because the two halves are on different hosts, the API must name this",
+    "site in CORS_ORIGINS and send its session cookie cross-site",
+    "(COOKIE_SAMESITE=none). Neither is guessable from here.",
     "",
     "This repository is an npm workspace, so the build runs the web workspace",
-    "and writes web/dist rather than the `public` Vercel looks for by default.",
-    "",
-    "The API requires DATABASE_URL — there is no disk here for a local database",
-    "— and S3_BUCKET, since uploaded files would otherwise be written to a",
-    "filesystem that is discarded. See .env.example."
+    "and writes web/dist rather than the `public` Vercel looks for by default."
   ],
 
   "buildCommand": "npm run build -w web",
   "outputDirectory": "web/dist",
 
-  "functions": {
-    "api/index.mjs": {
-      "maxDuration": 30
-    }
-  },
-
   "rewrites": [
     {
-      "//": "Everything the API owns goes to the function, with its path intact.",
-      "source": "/api/(.*)",
-      "destination": "/api"
-    },
-    {
-      "//": "Stored files are served by the API, which reads them from object storage.",
-      "source": "/uploads/(.*)",
-      "destination": "/api"
-    },
-    {
-      "//": "The portal resolves its own routes: /admin/students is not a file on disk, so anything that is not a real file returns index.html.",
+      "//": "The portal resolves its own routes: /admin/students is not a file on disk, so anything that is not a real file returns index.html. /api and /uploads belong to the API on Render — answering them with this site's HTML would turn a clear failure into a baffling one, the portal reading a web page where it expected data.",
       "source": "/((?!api/|uploads/).*)",
       "destination": "/index.html"
     }

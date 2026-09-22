@@ -1,0 +1,9 @@
+# The API is not deployed here; it runs on Render (see render.yaml).
+#
+# Vercel treats any file under api/ as a serverless function whether or not
+# vercel.json mentions it, so without this the portal would be deployed
+# alongside a second API — one with no database configured, answering the same
+# /api paths. Removing the file instead would lose the option of running the
+# whole thing on Vercel, which this keeps.
+api/
+server/
