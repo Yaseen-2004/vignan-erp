@@ -53,8 +53,14 @@ export function createResourceRouter(options) {
     entityType = table,
     /** { reference: { fieldOnTarget: nameHere } } — what the join used to lift. */
     populate = {},
-    /** { nameHere: { from: 'collection', on: 'field' } } — the count subqueries. */
+    /** { nameHere: { from, on, where?, sum? } } — the correlated COUNT/SUM subqueries. */
     counts = {},
+    /**
+     * Fields worked out from the record rather than fetched — what a CASE
+     * expression in the select produced, such as whether a loan is overdue.
+     * Given the row, it returns the fields to add to it.
+     */
+    derive = null,
     searchable = [],
     filterable = [],
     /**
@@ -219,21 +225,39 @@ export function createResourceRouter(options) {
 
     const ids = rows.map((r) => oid(r.id)).filter(Boolean);
     for (const name of names) {
-      const { from, on } = counts[name];
+      /*
+       * `where` narrows it, as the subquery's own WHERE did — the difference
+       * between how many copies a book has and how many are out. `sum` totals
+       * a field instead of counting rows, which is what COALESCE(SUM(x), 0)
+       * asked for; absent rows give 0 either way, as the COALESCE ensured.
+       */
+      const { from, on, where = {}, sum = null } = counts[name];
       const M = byCollection[from];
       if (!M) { rows.forEach((r) => { r[name] = 0; }); continue; }
 
-      // One grouped query per count rather than one per row: a page of
+      // One grouped query per column rather than one per row: a page of
       // twenty-five would otherwise be twenty-five round trips per column.
       const grouped = await M.aggregate([
-        { $match: { [on]: { $in: ids } } },
-        { $group: { _id: `$${on}`, n: { $sum: 1 } } },
+        { $match: { ...where, [on]: { $in: ids } } },
+        {
+          $group: {
+            _id: `$${on}`,
+            n: sum ? { $sum: { $ifNull: [`$${sum}`, 0] } } : { $sum: 1 },
+          },
+        },
       ]);
       const byId = new Map(grouped.map((g) => [String(g._id), g.n]));
       for (const row of rows) row[name] = byId.get(String(row.id)) ?? 0;
     }
     return rows;
   }
+
+  /** Add the fields a CASE expression used to produce. */
+  const withDerived = (rows) => {
+    if (!derive) return rows;
+    for (const row of rows) Object.assign(row, derive(row) || {});
+    return rows;
+  };
 
   /**
    * Fetch one record, already confined to the caller's department.
@@ -257,7 +281,7 @@ export function createResourceRouter(options) {
     if (!doc) return null;
 
     const row = Object.keys(populate).length ? lift(doc, populate) : plain(doc);
-    return (await withCounts([row]))[0];
+    return withDerived(await withCounts([row]))[0];
   }
 
   async function assertAccess(req, row) {
@@ -328,7 +352,7 @@ export function createResourceRouter(options) {
       if (Object.keys(populate).length) query.populate(populateFor(populate));
 
       const [docs, total] = await Promise.all([query.exec(), Model.countDocuments(filter)]);
-      const rows = await withCounts(Object.keys(populate).length ? lift(docs, populate) : plain(docs));
+      const rows = withDerived(await withCounts(Object.keys(populate).length ? lift(docs, populate) : plain(docs)));
 
       return paginated(res, rows, total, { page, limit });
     })

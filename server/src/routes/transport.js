@@ -4,6 +4,7 @@ import { asyncHandler, ok } from '../lib/http.js';
 import { requirePermission } from '../middleware/auth.js';
 import { createResourceRouter } from '../lib/crud.js';
 import { isAdmin, accessibleStudentIds } from '../lib/scope.js';
+import { oid } from '../db/mongo/connection.js';
 
 const router = Router();
 
@@ -13,12 +14,13 @@ router.use(
     table: 'vehicles',
     module: 'transport',
     entityType: 'Vehicle',
-    alias: 'v',
-    select: `v.*, (SELECT COUNT(*) FROM routes r WHERE r.vehicle_id = v.id) AS route_count,
-             (SELECT COUNT(*) FROM transport_allocations ta WHERE ta.vehicle_id = v.id AND ta.status = 'ACTIVE') AS student_count,
-             (SELECT COALESCE(SUM(fr.total_cost), 0) FROM fuel_records fr WHERE fr.vehicle_id = v.id) AS fuel_cost,
-             (SELECT COALESCE(SUM(vm.cost), 0) FROM vehicle_maintenance vm WHERE vm.vehicle_id = v.id) AS maintenance_cost`,
-    searchable: ['v.vehicle_number', 'v.model'],
+    counts: {
+      route_count: { from: 'routes', on: 'vehicle_id' },
+      student_count: { from: 'transport_allocations', on: 'vehicle_id', where: { status: 'ACTIVE' } },
+      fuel_cost: { from: 'fuel_records', on: 'vehicle_id', sum: 'total_cost' },
+      maintenance_cost: { from: 'vehicle_maintenance', on: 'vehicle_id', sum: 'cost' },
+    },
+    searchable: ['vehicle_number', 'model'],
     filterable: ['vehicle_type', 'status'],
     sortable: ['id', 'vehicle_number', 'capacity'],
     required: ['vehicle_number'],
@@ -32,10 +34,8 @@ router.use(
     table: 'drivers',
     module: 'transport',
     entityType: 'Driver',
-    alias: 'd',
-    select: `d.*, v.vehicle_number`,
-    joins: `LEFT JOIN vehicles v ON v.id = d.vehicle_id`,
-    searchable: ['d.name', 'd.phone', 'd.license_number'],
+    populate: { vehicle_id: { vehicle_number: 'vehicle_number' } },
+    searchable: ['name', 'phone', 'license_number'],
     filterable: ['status', 'vehicle_id'],
     sortable: ['id', 'name'],
     required: ['name', 'phone', 'license_number'],
@@ -49,11 +49,14 @@ router.use(
     table: 'routes',
     module: 'transport',
     entityType: 'Route',
-    alias: 'r',
-    select: `r.*, v.vehicle_number, v.capacity, d.name AS driver_name, d.phone AS driver_phone,
-             (SELECT COUNT(*) FROM transport_allocations ta WHERE ta.route_id = r.id AND ta.status = 'ACTIVE') AS student_count`,
-    joins: `LEFT JOIN vehicles v ON v.id = r.vehicle_id LEFT JOIN drivers d ON d.id = r.driver_id`,
-    searchable: ['r.name', 'r.route_code', 'r.start_point', 'r.end_point'],
+    populate: {
+      vehicle_id: { vehicle_number: 'vehicle_number', capacity: 'capacity' },
+      driver_id: { name: 'driver_name', phone: 'driver_phone' },
+    },
+    counts: {
+      student_count: { from: 'transport_allocations', on: 'route_id', where: { status: 'ACTIVE' } },
+    },
+    searchable: ['name', 'route_code', 'start_point', 'end_point'],
     filterable: ['status', 'vehicle_id', 'driver_id'],
     sortable: ['id', 'name', 'fare'],
     required: ['route_code', 'name'],
@@ -67,25 +70,36 @@ router.use(
     table: 'transport_allocations',
     module: 'transport',
     entityType: 'Transport Allocation',
-    alias: 'ta',
-    select: `ta.*, s.first_name, s.last_name, s.admission_number, c.name AS class_name, sec.name AS section_name,
-             r.name AS route_name, r.route_code, v.vehicle_number, d.name AS driver_name, d.phone AS driver_phone`,
-    joins: `JOIN students s ON s.id = ta.student_id
-            LEFT JOIN classes c ON c.id = s.class_id
-            LEFT JOIN sections sec ON sec.id = s.section_id
-            JOIN routes r ON r.id = ta.route_id
-            LEFT JOIN vehicles v ON v.id = COALESCE(ta.vehicle_id, r.vehicle_id)
-            LEFT JOIN drivers d ON d.id = r.driver_id`,
-    searchable: ['s.first_name', 's.admission_number', 'r.name'],
+    populate: {
+      student_id: { first_name: 'first_name', last_name: 'last_name', admission_number: 'admission_number' },
+      'student_id.class_id': { name: 'class_name' },
+      'student_id.section_id': { name: 'section_name' },
+      route_id: { name: 'route_name', route_code: 'route_code' },
+      'route_id.driver_id': { name: 'driver_name', phone: 'driver_phone' },
+      /*
+       * The vehicle was joined on COALESCE(ta.vehicle_id, r.vehicle_id): an
+       * allocation may name its own vehicle, and otherwise takes the route's.
+       * Both are fetched and the fallback applied below, because a populate
+       * cannot express "this one, or that one".
+       */
+      vehicle_id: { vehicle_number: 'own_vehicle_number' },
+      'route_id.vehicle_id': { vehicle_number: 'route_vehicle_number' },
+    },
+    derive: (row) => ({
+      vehicle_number: row.own_vehicle_number ?? row.route_vehicle_number ?? null,
+    }),
+    searchable: [],
     filterable: ['student_id', 'route_id', 'status', 'academic_year_id'],
     sortable: ['id'],
     required: ['student_id', 'route_id'],
     // Students and parents only see their own allocation.
-    scopeClause: async (req) => {
+    scopeFilter: async (req) => {
       const allowed = await accessibleStudentIds(req.user);
       if (allowed === null) return null;
-      if (!allowed.length) return { clause: '1 = 0', params: [] };
-      return { clause: `ta.student_id IN (${allowed.map(() => '?').join(',')})`, params: allowed };
+      // Entitled to none must mean none: a filter on a field is dropped by
+      // strictQuery, and a dropped filter shows everything.
+      if (!allowed.length) return { $expr: { $eq: [1, 0] } };
+      return { student_id: { $in: allowed.map(oid).filter(Boolean) } };
     },
   })
 );
@@ -96,10 +110,11 @@ router.use(
     table: 'fuel_records',
     module: 'transport',
     entityType: 'Fuel Record',
-    alias: 'fr',
-    select: `fr.*, v.vehicle_number, u.full_name AS recorded_by_name`,
-    joins: `JOIN vehicles v ON v.id = fr.vehicle_id LEFT JOIN users u ON u.id = fr.recorded_by`,
-    searchable: ['v.vehicle_number', 'fr.bill_number'],
+    populate: {
+      vehicle_id: { vehicle_number: 'vehicle_number' },
+      recorded_by: { full_name: 'recorded_by_name' },
+    },
+    searchable: ['bill_number'],
     filterable: ['vehicle_id'],
     sortable: ['id', 'fuel_date', 'total_cost'],
     required: ['vehicle_id', 'litres', 'rate_per_litre', 'total_cost'],
@@ -114,10 +129,11 @@ router.use(
     table: 'vehicle_maintenance',
     module: 'transport',
     entityType: 'Vehicle Maintenance',
-    alias: 'vm',
-    select: `vm.*, v.vehicle_number, u.full_name AS recorded_by_name`,
-    joins: `JOIN vehicles v ON v.id = vm.vehicle_id LEFT JOIN users u ON u.id = vm.recorded_by`,
-    searchable: ['v.vehicle_number', 'vm.service_type', 'vm.garage'],
+    populate: {
+      vehicle_id: { vehicle_number: 'vehicle_number' },
+      recorded_by: { full_name: 'recorded_by_name' },
+    },
+    searchable: ['service_type', 'garage'],
     filterable: ['vehicle_id'],
     sortable: ['id', 'service_date', 'cost'],
     required: ['vehicle_id', 'service_type'],
@@ -132,10 +148,8 @@ router.use(
     table: 'driver_attendance',
     module: 'transport',
     entityType: 'Driver Attendance',
-    alias: 'da',
-    select: `da.*, d.name AS driver_name, d.phone`,
-    joins: `JOIN drivers d ON d.id = da.driver_id`,
-    searchable: ['d.name'],
+    populate: { driver_id: { name: 'driver_name', phone: 'phone' } },
+    searchable: [],
     filterable: ['driver_id', 'status', 'attendance_date'],
     sortable: ['id', 'attendance_date'],
     required: ['driver_id', 'attendance_date', 'status'],

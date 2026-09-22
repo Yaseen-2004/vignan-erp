@@ -20,9 +20,11 @@ router.use(
     table: 'books',
     module: 'library',
     entityType: 'Book',
-    alias: 'b',
-    select: `b.*, (SELECT COUNT(*) FROM book_transactions bt WHERE bt.book_id = b.id AND bt.status = 'ISSUED') AS issued_count`,
-    searchable: ['b.title', 'b.author', 'b.isbn', 'b.publisher', 'b.category'],
+    counts: {
+      // How many copies are out, not how many exist.
+      issued_count: { from: 'book_transactions', on: 'book_id', where: { status: 'ISSUED' } },
+    },
+    searchable: ['title', 'author', 'isbn', 'publisher', 'category'],
     filterable: ['category', 'status', 'language'],
     sortable: ['id', 'title', 'author', 'available_copies'],
     required: ['title'],
@@ -35,28 +37,31 @@ const transactionsRouter = createResourceRouter({
   table: 'book_transactions',
   module: 'library',
   entityType: 'Book Transaction',
-  alias: 'bt',
-  select: `bt.*, b.title AS book_title, b.author, b.isbn,
-           s.first_name, s.last_name, s.admission_number, c.name AS class_name,
-           fu.full_name AS faculty_name, iu.full_name AS issued_by_name,
-           CASE WHEN bt.status = 'ISSUED' AND substr(bt.due_date, 1, 10) < to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD') THEN 1 ELSE 0 END AS is_overdue`,
-  joins: `JOIN books b ON b.id = bt.book_id
-          LEFT JOIN students s ON s.id = bt.student_id
-          LEFT JOIN classes c ON c.id = s.class_id
-          LEFT JOIN faculty f ON f.id = bt.faculty_id
-          LEFT JOIN users fu ON fu.id = f.user_id
-          LEFT JOIN users iu ON iu.id = bt.issued_by`,
-  searchable: ['b.title', 's.first_name', 's.admission_number'],
+  populate: {
+    book_id: { title: 'book_title', author: 'author', isbn: 'isbn' },
+    student_id: { first_name: 'first_name', last_name: 'last_name', admission_number: 'admission_number' },
+    'student_id.class_id': { name: 'class_name' },
+    'faculty_id.user_id': { full_name: 'faculty_name' },
+    issued_by: { full_name: 'issued_by_name' },
+  },
+  /** What the CASE expression worked out: a loan still out, past its date. */
+  derive: (row) => ({
+    is_overdue: row.status === 'ISSUED'
+      && row.due_date
+      && String(row.due_date).slice(0, 10) < new Date().toISOString().slice(0, 10)
+      ? 1 : 0,
+  }),
+  searchable: [],
   filterable: ['book_id', 'student_id', 'faculty_id', 'status', 'member_type'],
   sortable: ['id', 'issue_date', 'due_date'],
   defaultSort: 'issue_date',
   readOnly: true,
-  scopeClause: async (req) => {
+  scopeFilter: async (req) => {
     // Students see only their own borrowing history.
     if (!isStudent(req.user) && !isParent(req.user)) return null;
     const allowed = await accessibleStudentIds(req.user);
-    if (!allowed?.length) return { clause: '1 = 0', params: [] };
-    return { clause: `bt.student_id IN (${allowed.map(() => '?').join(',')})`, params: allowed };
+    if (!allowed?.length) return { $expr: { $eq: [1, 0] } };
+    return { student_id: { $in: allowed.map(oid).filter(Boolean) } };
   },
 });
 
@@ -197,21 +202,21 @@ const finesRouter = createResourceRouter({
   table: 'fines',
   module: 'library',
   entityType: 'Fine',
-  alias: 'fn',
-  select: `fn.*, s.first_name, s.last_name, s.admission_number, b.title AS book_title, u.full_name AS collected_by_name`,
-  joins: `LEFT JOIN students s ON s.id = fn.student_id
-          LEFT JOIN book_transactions bt ON bt.id = fn.book_transaction_id
-          LEFT JOIN books b ON b.id = bt.book_id
-          LEFT JOIN users u ON u.id = fn.collected_by`,
-  searchable: ['s.first_name', 's.admission_number', 'b.title'],
+  populate: {
+    student_id: { first_name: 'first_name', last_name: 'last_name', admission_number: 'admission_number' },
+    // The book is reached through the loan the fine is against.
+    'book_transaction_id.book_id': { title: 'book_title' },
+    collected_by: { full_name: 'collected_by_name' },
+  },
+  searchable: [],
   filterable: ['student_id', 'faculty_id', 'paid', 'fine_type'],
   sortable: ['id', 'amount', 'created_at'],
   defaultSort: 'created_at',
-  scopeClause: async (req) => {
+  scopeFilter: async (req) => {
     if (!isStudent(req.user) && !isParent(req.user)) return null;
     const allowed = await accessibleStudentIds(req.user);
-    if (!allowed?.length) return { clause: '1 = 0', params: [] };
-    return { clause: `fn.student_id IN (${allowed.map(() => '?').join(',')})`, params: allowed };
+    if (!allowed?.length) return { $expr: { $eq: [1, 0] } };
+    return { student_id: { $in: allowed.map(oid).filter(Boolean) } };
   },
 });
 

@@ -185,6 +185,67 @@ check('every write was recorded', logged.length >= 3, `${logged.length} entries`
 check('the audit entry points at the record', logged.some((l) => l.entity_id === createdId),
   'an id from any collection, so stored as text');
 
+/* ------------------------------ conditional counts, sums and derived fields */
+const vehicle = await M.Vehicle.create({
+  campus_id: campus._id, vehicle_number: 'KA-28-1234', vehicle_type: 'BUS',
+  capacity: 40, status: 'ACTIVE',
+});
+const routeDoc = await M.Route.create({
+  campus_id: campus._id, route_code: 'R1', name: 'North', vehicle_id: vehicle._id,
+  fare: 1200, status: 'ACTIVE',
+});
+for (const [n, status] of [[1, 'ACTIVE'], [2, 'ACTIVE'], [3, 'INACTIVE']]) {
+  const u = await M.User.create({
+    campus_id: campus._id, role_id: roleAdmin._id, username: `tp${n}`, email: `tp${n}@v.edu`,
+    password_hash: 'x', full_name: `TP${n}`, status: 'ACTIVE',
+  });
+  const st = await M.Student.create({
+    campus_id: campus._id, user_id: u._id, academic_year_id: year._id,
+    class_id: stateClass._id, admission_number: `TP${n}`, first_name: `TP${n}`,
+    board: 'STATE', status: 'ACTIVE',
+  });
+  await M.TransportAllocation.create({
+    campus_id: campus._id, student_id: st._id, route_id: routeDoc._id,
+    vehicle_id: vehicle._id, status, fare: 1200,
+  });
+}
+await M.FuelRecord.create({ campus_id: campus._id, vehicle_id: vehicle._id, fuel_date: '2026-09-01', litres: 50, rate_per_litre: 100, total_cost: 5000 });
+await M.FuelRecord.create({ campus_id: campus._id, vehicle_id: vehicle._id, fuel_date: '2026-09-08', litres: 40, rate_per_litre: 100, total_cost: 4000 });
+
+const vehiclesApp = express();
+vehiclesApp.use(express.json());
+vehiclesApp.use((req, _res, next) => { req.user = current; req.permissions = { has: () => true }; next(); });
+vehiclesApp.use('/vehicles', createResourceRouter({
+  table: 'vehicles',
+  module: 'transport',
+  entityType: 'Vehicle',
+  counts: {
+    route_count: { from: 'routes', on: 'vehicle_id' },
+    student_count: { from: 'transport_allocations', on: 'vehicle_id', where: { status: 'ACTIVE' } },
+    fuel_cost: { from: 'fuel_records', on: 'vehicle_id', sum: 'total_cost' },
+    maintenance_cost: { from: 'vehicle_maintenance', on: 'vehicle_id', sum: 'cost' },
+  },
+  derive: (row) => ({ spare_seats: Number(row.capacity || 0) - Number(row.student_count || 0) }),
+  searchable: ['vehicle_number'],
+  sortable: ['id', 'vehicle_number'],
+  required: ['vehicle_number'],
+  defaultSort: 'vehicle_number',
+}));
+vehiclesApp.use(errorHandler);
+const vServer = vehiclesApp.listen(0);
+const vPort = vServer.address().port;
+const v = (await (await fetch(`http://localhost:${vPort}/vehicles`)).json()).data[0];
+
+check('a plain count is answered', v.route_count === 1, `route_count=${v.route_count}`);
+check('a conditional count excludes what it should',
+  v.student_count === 2, `student_count=${v.student_count} (3 allocations, 1 inactive)`);
+check('a sum totals the field', v.fuel_cost === 9000, `fuel_cost=${v.fuel_cost}`);
+check('a sum with no rows is zero, not missing',
+  v.maintenance_cost === 0, `maintenance_cost=${v.maintenance_cost}`);
+check('a derived field is computed from the row',
+  v.spare_seats === 38, `spare_seats=${v.spare_seats}`);
+
+vServer.close();
 server.close();
 await mongo.stop();
 
