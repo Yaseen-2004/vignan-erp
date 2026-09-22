@@ -9,8 +9,8 @@
  * So each audience is asked for, and checked both for who it includes and who
  * it leaves out.
  */
-import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import { startMongo } from './mongo-harness.js';
 
 const results = [];
 const check = (label, ok, detail = '') => {
@@ -20,8 +20,7 @@ const check = (label, ok, detail = '') => {
 
 console.log('\nVignan ERP — notification audiences on MongoDB\n');
 
-const mongod = await MongoMemoryServer.create();
-await mongoose.connect(mongod.getUri(), { dbName: 'vignan' });
+const mongo = await startMongo();
 
 const M = await import('../src/db/mongo/models.js');
 const { resolveAudience, notify, notifyMany } = await import('../src/lib/notify.js');
@@ -121,8 +120,7 @@ check('and records what it was about', saved.entity_id === String(pupilA.student
 const sent = await notifyMany([String(pupilA.user._id), String(pupilB.user._id), String(pupilA.user._id)], { type: 'T', title: 'Many' });
 check('notifyMany does not write the same person twice', sent === 2, `${sent} written`);
 
-await mongoose.disconnect();
-await mongod.stop();
+await mongo.stop();
 
 const failed = results.filter((x) => !x).length;
 console.log(`\n  ${results.length - failed} passed, ${failed} failed\n`);

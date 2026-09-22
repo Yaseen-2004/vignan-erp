@@ -11,8 +11,8 @@
  * that the right people get in and that the wrong ones do not, because a gate
  * that refuses everybody passes every test that only checks refusals.
  */
-import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import { startMongo } from './mongo-harness.js';
 
 const results = [];
 const check = (label, ok, detail = '') => {
@@ -22,8 +22,7 @@ const check = (label, ok, detail = '') => {
 
 console.log('\nVignan ERP — access scoping on MongoDB\n');
 
-const mongod = await MongoMemoryServer.create();
-await mongoose.connect(mongod.getUri(), { dbName: 'vignan' });
+const mongo = await startMongo();
 
 const M = await import('../src/db/mongo/models.js');
 const scope = await import('../src/lib/scope.js');
@@ -178,8 +177,7 @@ check('a real scope still filters normally', typeof visible === 'number', `${vis
 check('ids compare across string and ObjectId', scope.sameId(pupilState._id, String(pupilState._id)));
 check('and different ids do not', !scope.sameId(pupilState._id, pupilCbse._id));
 
-await mongoose.disconnect();
-await mongod.stop();
+await mongo.stop();
 
 const failed = results.filter((x) => !x).length;
 console.log(`\n  ${results.length - failed} passed, ${failed} failed\n`);

@@ -1,69 +1,78 @@
+/**
+ * The generic resource router.
+ *
+ * Forty-four resources are built on this, so what it gets right or wrong, it
+ * gets right or wrong forty-four times — including the department ceiling that
+ * keeps one wing of the school out of the other's records.
+ *
+ * Ported to MongoDB. Three things in the old interface were SQL and had to
+ * become something else:
+ *
+ *   joins + select   ->  `populate`, a map of reference to the fields lifted
+ *                        out of it. `JOIN classes c ... c.name AS class_name`
+ *                        is `{ class_id: { name: 'class_name' } }`.
+ *
+ *   count subqueries ->  `counts`. `(SELECT COUNT(*) FROM classes WHERE
+ *                        academic_year_id = ay.id) AS class_count` is
+ *                        `{ class_count: { from: 'classes', on: 'academic_year_id' } }`.
+ *
+ *   boardColumn      ->  `board`. A record either carries its own department,
+ *                        or reaches it through a reference — a section's
+ *                        department is its class's. Both are declared rather
+ *                        than written as a join.
+ *
+ * What it returns is unchanged: a flat record carrying `class_name` and
+ * `class_count` beside its own fields, which is what the portal reads.
+ */
 import { Router } from 'express';
-import { all, get, insert, update, remove, scalar, tableColumns } from '../db/connection.js';
-import { asyncHandler, pagination, paginated, ok, created, safeSort } from './http.js';
+import mongoose from 'mongoose';
+import { byCollection } from '../db/mongo/models.js';
+import { oid } from '../db/mongo/connection.js';
+import { escapeRegex, lift, plain, populateFor } from '../db/mongo/query.js';
+import { asyncHandler, pagination, paginated, ok, created } from './http.js';
 import { notFound, forbidden, badRequest } from './errors.js';
 import { requirePermission } from '../middleware/auth.js';
 import { logActivity, diff } from './audit.js';
-import { boardClause, boardOf, isAdmin } from './scope.js';
+import { boardOf, isAdmin, sameId } from './scope.js';
 
 /**
- * Builds a fully guarded CRUD router for one table.
+ * A route parameter that is an identifier.
  *
- * Every generated endpoint performs the five mandated checks:
- *   1. authentication  — applied by the parent router
- *   2. role            — implied by the permission matrix
- *   3. permission      — requirePermission(`${module}.${action}`)
- *   4. ownership       — options.rowFilter / options.canAccess
- *   5. assignment      — options.scopeClause (e.g. only assigned courses)
- *
- * and writes an audit entry with before/after values for every mutation.
- *
- * @param {object} options
- * @param {string} options.table            physical table name
- * @param {string} options.module           permission module (e.g. 'students')
- * @param {string} [options.entityType]     label used in the audit log
- * @param {string} [options.alias]          SQL alias for the base table
- * @param {string} [options.select]         custom column list for list/detail
- * @param {string} [options.joins]          JOIN clauses used with `select`
- * @param {string[]} [options.searchable]   columns matched by ?search=
- * @param {string[]} [options.filterable]   columns matched by exact ?column=
- * @param {string[]} [options.sortable]     columns allowed in ?sort=
- * @param {string[]} [options.writable]     columns a client may write
- * @param {string[]} [options.required]     columns required on create
- * @param {boolean} [options.campusScoped]  restrict rows to the caller's campus
- * @param {string}  [options.defaultSort]
- * @param {function} [options.scopeClause]  (req) => ({ clause, params })
- * @param {function} [options.canAccess]    (req, row) => boolean
- * @param {function} [options.beforeCreate] (data, req) => data
- * @param {function} [options.beforeUpdate] (data, req, existing) => data
- * @param {function} [options.afterCreate]  (row, req) => void
- * @param {function} [options.afterUpdate]  (row, req, before) => void
- * @param {function} [options.beforeDelete] (row, req) => void
- * @param {boolean} [options.readOnly]      expose only list/detail
+ * It used to be `[0-9]+`, which kept literal sub-routes like `/pending` from
+ * being swallowed by the detail route. An ObjectId is twenty-four hex
+ * characters, so that pattern now matches nothing at all — every detail route
+ * would have returned "not found" for every record, which is the kind of
+ * breakage that looks like missing data rather than a broken route.
  */
+export const ID_PARAM = '/:id([0-9a-fA-F]{24})';
+
 export function createResourceRouter(options) {
   const {
     table,
     module,
     entityType = table,
-    alias = 't',
-    select,
-    joins = '',
+    /** { reference: { fieldOnTarget: nameHere } } — what the join used to lift. */
+    populate = {},
+    /** { nameHere: { from: 'collection', on: 'field' } } — the count subqueries. */
+    counts = {},
     searchable = [],
     filterable = [],
     /**
-     * Qualified column holding this resource's department, e.g. 'c.board'.
+     * Where this resource's department lives: a field on the record itself
+     * (`'board'`), or one reached through a reference
+     * (`{ via: 'class_id', field: 'board' }`).
+     *
      * When set, a user assigned to one department can neither list nor write
      * records belonging to the other — the ?board= filter may narrow further
      * but never widens past this.
      */
-    boardColumn = null,
+    board = null,
     sortable = ['id'],
     writable,
     required = [],
     campusScoped = true,
     defaultSort = 'id',
-    scopeClause,
+    scopeFilter,
     canAccess,
     beforeCreate,
     beforeUpdate,
@@ -74,11 +83,15 @@ export function createResourceRouter(options) {
     permissions = {},
   } = options;
 
+  const Model = byCollection[table];
+  if (!Model) throw new Error(`createResourceRouter: no collection named "${table}"`);
+
   const router = Router();
-  const columns = tableColumns(table).map((c) => c.name);
+
+  const paths = Object.keys(Model.schema.paths);
+  const columns = paths.map((p) => (p === '_id' ? 'id' : p));
   const writableColumns =
-    writable ||
-    columns.filter((c) => !['id', 'created_at', 'updated_at', 'campus_id', 'created_by'].includes(c));
+    writable || paths.filter((c) => !['_id', '__v', 'created_at', 'updated_at', 'campus_id', 'created_by'].includes(c));
 
   const perm = {
     view: permissions.view ?? `${module}.view`,
@@ -87,112 +100,175 @@ export function createResourceRouter(options) {
     delete: permissions.delete ?? `${module}.delete`,
   };
 
-  const hasCampus = columns.includes('campus_id');
-  const baseSelect = select || `${alias}.*`;
-  const from = `FROM ${table} ${alias} ${joins}`;
+  const hasCampus = paths.includes('campus_id');
+  const references = new Set(
+    paths.filter((p) => Model.schema.paths[p]?.options?.ref)
+  );
 
-  /** WHERE fragments shared by list and detail. */
-  async function buildScope(req) {
-    const clauses = [];
-    const params = [];
-
-    if (campusScoped && hasCampus) {
-      // Admin may inspect any campus; everyone else is pinned to their own.
-      if (isAdmin(req.user)) {
-        if (req.query.campus_id) {
-          clauses.push(`${alias}.campus_id = ?`);
-          params.push(Number(req.query.campus_id));
-        }
-      } else if (req.user.campus_id) {
-        clauses.push(`${alias}.campus_id = ?`);
-        params.push(req.user.campus_id);
+  /** Values destined for a reference must be ObjectIds, not the strings they arrive as. */
+  const coerce = (data) => {
+    const out = { ...data };
+    for (const key of Object.keys(out)) {
+      if (references.has(key) && out[key] != null && out[key] !== '') {
+        const id = oid(out[key]);
+        if (!id) throw badRequest(`${key} is not a valid reference`);
+        out[key] = id;
+      } else if (out[key] === '') {
+        out[key] = null;
       }
     }
+    return out;
+  };
 
-    // The department a user is confined to is a ceiling, not a preference.
-    if (boardColumn) {
-      const confine = await boardClause(req.user, boardColumn);
-      if (confine) {
-        clauses.push(confine.clause);
-        params.push(...confine.params);
-      }
-    }
-
-    if (scopeClause) {
-      const extra = await scopeClause(req);
-      if (extra?.clause) {
-        clauses.push(extra.clause);
-        params.push(...(extra.params || []));
-      }
-    }
-    return { clauses, params };
-  }
+  /* ================================================================== */
+  /*  THE DEPARTMENT CEILING                                            */
+  /* ================================================================== */
 
   /**
-   * Fetch one row, already confined to the caller's department.
+   * A filter confining a query to the user's department, or null.
    *
-   * Filtering the list is not enough: without this, a deep link to a record in
-   * the other wing would still resolve. Applying the clause in the WHERE means
-   * such a record simply does not exist for that user, and `assertAccess`
-   * turns that into the same "not found" any bad id gets.
+   * When the department lives on a referenced record — a section's is its
+   * class's — the referenced ids are resolved first and the filter narrows to
+   * those. It is an extra query, and it is what the join did.
    */
-  async function fetchById(req, id) {
-    const clauses = [`${alias}.id = ?`];
-    const params = [Number(id)];
-    if (boardColumn) {
-      const confine = await boardClause(req.user, boardColumn);
-      if (confine) {
-        clauses.push(confine.clause);
-        params.push(...confine.params);
-      }
-    }
-    return await get(`SELECT ${baseSelect} ${from} WHERE ${clauses.join(' AND ')}`, params);
+  async function boardFilter(user) {
+    if (!board) return null;
+    const wing = await boardOf(user);
+    if (!wing) return null;
+
+    if (typeof board === 'string') return { [board]: wing };
+
+    // The department lives on a referenced record — a section's is its class's.
+    const ref = Model.schema.paths[board.via]?.options?.ref;
+    if (!ref) return null;
+    const Via = mongoose.model(ref);
+
+    const ids = await Via.find({ [board.field || 'board']: wing }).select('_id').lean();
+    return { [board.via]: { $in: ids.map((r) => r._id) } };
   }
 
   /**
    * Refuse a write that would place a record in the other department.
    *
-   * Reading is confined by the WHERE clause, but a create carries its own
-   * department: either directly (a class has `board`) or through its parent (a
-   * section belongs to a class, a course assignment to a section). Resolving it
-   * from whichever key the payload carries covers both shapes without each
-   * resource having to describe itself.
+   * Reading is confined by the filter, but a create carries its own department:
+   * either directly (a class has `board`) or through its parent (a section
+   * belongs to a class, a course assignment to a section). Resolving it from
+   * whichever key the payload carries covers both shapes without each resource
+   * having to describe itself.
    */
   async function assertPayloadBoard(req, data) {
-    if (!boardColumn) return;
+    if (!board) return;
     const wing = await boardOf(req.user);
     if (!wing) return;
 
-    let board = data.board;
-    if (!board && data.class_id) {
-      board = (await get('SELECT board FROM classes WHERE id = ?', [data.class_id]))?.board;
+    let value = data.board;
+    const lookup = async (collection, id, path = 'board') => {
+      const M = byCollection[collection];
+      const _id = oid(id);
+      if (!M || !_id) return null;
+      const row = await M.findById(_id).select(path).lean();
+      return row?.[path] ?? null;
+    };
+
+    if (!value && data.class_id) value = await lookup('classes', data.class_id);
+    if (!value && data.section_id) {
+      const section = await byCollection.sections?.findById(oid(data.section_id)).select('class_id').lean();
+      if (section) value = await lookup('classes', section.class_id);
     }
-    if (!board && data.section_id) {
-      board = (await get('SELECT c.board FROM sections s JOIN classes c ON c.id = s.class_id WHERE s.id = ?', [
-        data.section_id,
-      ]))?.board;
+    if (!value && data.course_id) {
+      const course = await byCollection.courses?.findById(oid(data.course_id)).select('class_id').lean();
+      if (course) value = await lookup('classes', course.class_id);
     }
-    if (!board && data.course_id) {
-      board = (await get('SELECT c.board FROM courses co JOIN classes c ON c.id = co.class_id WHERE co.id = ?', [
-        data.course_id,
-      ]))?.board;
-    }
-    if (board && board !== wing) {
+
+    if (value && value !== wing) {
       throw forbidden(
         `You are assigned to the ${wing === 'CBSE' ? 'CBSE' : 'State Board'} department and cannot create or change records in the other one.`
       );
     }
   }
 
+  /* ================================================================== */
+  /*  READING                                                           */
+  /* ================================================================== */
+
+  /** The filter shared by list and detail. */
+  async function buildScope(req) {
+    const filter = {};
+
+    if (campusScoped && hasCampus) {
+      // Admin may inspect any campus; everyone else is pinned to their own.
+      if (isAdmin(req.user)) {
+        if (req.query.campus_id) filter.campus_id = oid(req.query.campus_id);
+      } else if (req.user.campus_id) {
+        filter.campus_id = oid(req.user.campus_id);
+      }
+    }
+
+    // The department a user is confined to is a ceiling, not a preference.
+    const confine = await boardFilter(req.user);
+    if (confine) Object.assign(filter, confine);
+
+    if (scopeFilter) Object.assign(filter, (await scopeFilter(req)) || {});
+    return filter;
+  }
+
+  /** Attach the counts that were correlated subqueries. */
+  async function withCounts(rows) {
+    const names = Object.keys(counts);
+    if (!names.length || !rows.length) return rows;
+
+    const ids = rows.map((r) => oid(r.id)).filter(Boolean);
+    for (const name of names) {
+      const { from, on } = counts[name];
+      const M = byCollection[from];
+      if (!M) { rows.forEach((r) => { r[name] = 0; }); continue; }
+
+      // One grouped query per count rather than one per row: a page of
+      // twenty-five would otherwise be twenty-five round trips per column.
+      const grouped = await M.aggregate([
+        { $match: { [on]: { $in: ids } } },
+        { $group: { _id: `$${on}`, n: { $sum: 1 } } },
+      ]);
+      const byId = new Map(grouped.map((g) => [String(g._id), g.n]));
+      for (const row of rows) row[name] = byId.get(String(row.id)) ?? 0;
+    }
+    return rows;
+  }
+
+  /**
+   * Fetch one record, already confined to the caller's department.
+   *
+   * Filtering the list is not enough: without this, a deep link to a record in
+   * the other wing would still resolve. Applying the ceiling here means such a
+   * record simply does not exist for that user, and `assertAccess` turns that
+   * into the same "not found" any bad id gets.
+   */
+  async function fetchById(req, id) {
+    const _id = oid(id);
+    if (!_id) return null;
+
+    const filter = { _id };
+    const confine = await boardFilter(req.user);
+    if (confine) Object.assign(filter, confine);
+
+    const query = Model.findOne(filter);
+    if (Object.keys(populate).length) query.populate(populateFor(populate));
+    const doc = await query.exec();
+    if (!doc) return null;
+
+    const row = Object.keys(populate).length ? lift(doc, populate) : plain(doc);
+    return (await withCounts([row]))[0];
+  }
+
   async function assertAccess(req, row) {
     if (!row) throw notFound(`${entityType} not found`);
     if (
-      campusScoped &&
-      hasCampus &&
-      !isAdmin(req.user) &&
-      req.user.campus_id &&
-      row.campus_id &&
-      row.campus_id !== req.user.campus_id
+      campusScoped
+      && hasCampus
+      && !isAdmin(req.user)
+      && req.user.campus_id
+      && row.campus_id
+      && !sameId(row.campus_id, req.user.campus_id)
     ) {
       throw forbidden('This record belongs to a different campus');
     }
@@ -207,66 +283,60 @@ export function createResourceRouter(options) {
     '/',
     requirePermission(perm.view),
     asyncHandler(async (req, res) => {
-      const { page, limit, offset } = pagination(req.query);
-      const { column, direction } = safeSort(req.query, sortable, defaultSort);
-      const { clauses, params } = await buildScope(req);
+      const { page, limit } = pagination(req.query);
+      const filter = await buildScope(req);
 
       if (req.query.search && searchable.length) {
-        const term = `%${String(req.query.search).trim()}%`;
-        clauses.push(`(${searchable.map((c) => `${c} ILIKE ?`).join(' OR ')})`);
-        params.push(...searchable.map(() => term));
+        const term = new RegExp(escapeRegex(String(req.query.search).trim()), 'i');
+        filter.$or = searchable.map((c) => ({ [c]: term }));
       }
 
       for (const field of filterable) {
-        // A filter is either a column name, or { param, column } when the value
-        // lives on a joined table (e.g. filtering courses by their class board).
+        // A filter is either a field name, or { param, path } when the value is
+        // named differently in the query string.
         const param = typeof field === 'object' ? field.param : field;
-        const column = typeof field === 'object' ? field.column : field;
+        const path = typeof field === 'object' ? field.path || field.column : field;
         const value = req.query[param];
         if (value !== undefined && value !== '' && value !== 'ALL') {
-          const qualified = column.includes('.') ? column : `${alias}.${column}`;
-          clauses.push(`${qualified} = ?`);
-          params.push(value);
+          filter[path] = references.has(path) ? oid(value) : value;
         }
       }
 
-      // Optional date-range filter on any date-ish column via ?from=&to=&dateField=
+      // Optional date-range filter via ?from=&to=&dateField=
       const dateField = req.query.dateField;
-      if (dateField && columns.includes(dateField)) {
-        if (req.query.from) {
-          clauses.push(`substr(${alias}.${dateField}, 1, 10) >= ?`);
-          params.push(req.query.from);
-        }
-        if (req.query.to) {
-          clauses.push(`substr(${alias}.${dateField}, 1, 10) <= ?`);
-          params.push(req.query.to);
-        }
+      if (dateField && paths.includes(dateField)) {
+        const range = {};
+        if (req.query.from) range.$gte = String(req.query.from);
+        if (req.query.to) range.$lte = `${String(req.query.to)}￿`;
+        if (Object.keys(range).length) filter[dateField] = range;
       }
 
-      const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-      const sortColumn = column.includes('.') ? column : `${alias}.${column}`;
-      // A sort with ties has no defined order among them, so the same query can
-      // return rows in a different order each time — which means paging a list
-      // can show one row twice and skip another. `numeric_level` alone ties
-      // across the two departments, for instance. The primary key breaks every
-      // tie, so the order is total and paging is stable.
-      const orderBy = sortColumn === `${alias}.id`
-        ? `${sortColumn} ${direction}`
-        : `${sortColumn} ${direction}, ${alias}.id ${direction}`;
-      const total = Number(await scalar(`SELECT COUNT(*) AS n ${from} ${where}`, params) || 0);
-      const rows = await all(
-        `SELECT ${baseSelect} ${from} ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
-        [...params, limit, offset]
-      );
+      const requested = String(req.query.sort || defaultSort);
+      const column = sortable.includes(requested) ? requested : defaultSort;
+      const direction = String(req.query.order || 'desc').toLowerCase() === 'asc' ? 1 : -1;
+      const field = column === 'id' ? '_id' : column;
+
+      /*
+       * A sort with ties has no defined order among them, so the same query can
+       * return rows in a different order each time — which means paging a list
+       * can show one row twice and skip another. The key breaks every tie, so
+       * the order is total and paging is stable.
+       */
+      const sort = field === '_id' ? { _id: direction } : { [field]: direction, _id: direction };
+
+      const query = Model.find(filter).sort(sort).skip((page - 1) * limit).limit(limit);
+      if (Object.keys(populate).length) query.populate(populateFor(populate));
+
+      const [docs, total] = await Promise.all([query.exec(), Model.countDocuments(filter)]);
+      const rows = await withCounts(Object.keys(populate).length ? lift(docs, populate) : plain(docs));
+
       return paginated(res, rows, total, { page, limit });
     })
   );
 
   // ---------------------------------------------------------- DETAIL
-  // `:id` is digits-only so literal sub-routes (e.g. /grid, /pending) that a
-  // module registers alongside this factory are not shadowed by the detail route.
   router.get(
-    '/:id([0-9]+)',
+    ID_PARAM,
     requirePermission(perm.view),
     asyncHandler(async (req, res) => {
       const row = await fetchById(req, req.params.id);
@@ -288,88 +358,67 @@ export function createResourceRouter(options) {
       if (missing.length) throw badRequest(`Missing required field(s): ${missing.join(', ')}`);
 
       if (hasCampus) {
-        data.campus_id = isAdmin(req.user) && req.body.campus_id ? Number(req.body.campus_id) : req.user.campus_id;
+        data.campus_id = isAdmin(req.user) && req.body.campus_id ? req.body.campus_id : req.user.campus_id;
       }
-      if (columns.includes('created_by')) data.created_by = req.user.id;
+      if (paths.includes('created_by')) data.created_by = req.user.id;
 
       if (beforeCreate) data = (await beforeCreate(data, req)) ?? data;
       await assertPayloadBoard(req, data);
 
-      const id = await insert(table, data);
-      const row = await fetchById(req, id);
-
-      await logActivity({
-        req,
-        action: 'CREATE',
-        module,
-        entityType,
-        entityId: id,
-        description: `Created ${entityType} #${id}`,
-        newValues: data,
-      });
+      const doc = await Model.create(coerce(data));
+      const row = await fetchById(req, doc._id);
 
       if (afterCreate) await afterCreate(row, req);
+      await logActivity({
+        req, action: 'CREATE', module, entityType, entityId: String(doc._id),
+        description: `Created ${entityType}`, newValues: data,
+      });
       return created(res, row);
     })
   );
 
-  // ---------------------------------------------------------- UPDATE
-  router.put(
-    '/:id([0-9]+)',
+  // ----------------------------------------------------------- UPDATE
+  router.patch(
+    ID_PARAM,
     requirePermission(perm.edit),
     asyncHandler(async (req, res) => {
-      const id = Number(req.params.id);
-      // Read it through the confined fetch first: a record in the other wing
-      // must not exist for this user, whether they are reading or writing it.
-      if (!await fetchById(req, id)) throw notFound(`${entityType} not found`);
-      const existing = await get(`SELECT * FROM ${table} WHERE id = ?`, [id]);
+      const id = req.params.id;
+      const existing = await fetchById(req, id);
       await assertAccess(req, existing);
 
       let data = pick(req.body, writableColumns);
       if (beforeUpdate) data = (await beforeUpdate(data, req, existing)) ?? data;
-      if (!Object.keys(data).length) throw badRequest('No updatable fields supplied');
-      await assertPayloadBoard(req, data);
+      await assertPayloadBoard(req, { ...existing, ...data });
 
-      await update(table, id, data);
+      if (Object.keys(data).length) {
+        await Model.updateOne({ _id: oid(id) }, { $set: coerce(data) }, { runValidators: true });
+      }
       const row = await fetchById(req, id);
-      const changes = diff(existing, { ...existing, ...data });
-
-      await logActivity({
-        req,
-        action: 'UPDATE',
-        module,
-        entityType,
-        entityId: id,
-        description: `Updated ${entityType} #${id}`,
-        oldValues: changes.old,
-        newValues: changes.new,
-      });
 
       if (afterUpdate) await afterUpdate(row, req, existing);
+      const changes = diff(existing, row);
+      await logActivity({
+        req, action: 'UPDATE', module, entityType, entityId: String(id),
+        description: `Updated ${entityType}`, oldValues: changes.old, newValues: changes.new,
+      });
       return ok(res, row);
     })
   );
 
-  // ---------------------------------------------------------- DELETE
+  // ----------------------------------------------------------- DELETE
   router.delete(
-    '/:id([0-9]+)',
+    ID_PARAM,
     requirePermission(perm.delete),
     asyncHandler(async (req, res) => {
-      const id = Number(req.params.id);
-      if (!await fetchById(req, id)) throw notFound(`${entityType} not found`);
-      const existing = await get(`SELECT * FROM ${table} WHERE id = ?`, [id]);
+      const id = req.params.id;
+      const existing = await fetchById(req, id);
       await assertAccess(req, existing);
       if (beforeDelete) await beforeDelete(existing, req);
 
-      await remove(table, id);
+      await Model.deleteOne({ _id: oid(id) });
       await logActivity({
-        req,
-        action: 'DELETE',
-        module,
-        entityType,
-        entityId: id,
-        description: `Deleted ${entityType} #${id}`,
-        oldValues: existing,
+        req, action: 'DELETE', module, entityType, entityId: String(id),
+        description: `Deleted ${entityType}`, oldValues: existing,
       });
       return ok(res, { id, deleted: true });
     })
@@ -378,10 +427,9 @@ export function createResourceRouter(options) {
   return router;
 }
 
-/** Copy only the allowed keys from a request body. */
+/** Only the fields a caller is allowed to set, and only those they sent. */
 export function pick(body, allowed) {
   const out = {};
-  if (!body || typeof body !== 'object') return out;
   for (const key of allowed) {
     if (body[key] !== undefined) out[key] = body[key];
   }

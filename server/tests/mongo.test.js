@@ -11,17 +11,14 @@
  * refused two hundred times over. It is here so the gap is visible and stays
  * visible until the data layer closes it.
  */
-import { MongoMemoryServer } from 'mongodb-memory-server';
 import mongoose from 'mongoose';
+import { startMongo } from './mongo-harness.js';
 
 const results = [];
 const check = (label, ok, detail = '') => { results.push(ok); console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${label}${detail ? ` — ${detail}` : ''}`); };
 
-console.log('  starting a real mongod (first run downloads it)...');
-const mongod = await MongoMemoryServer.create();
-const uri = mongod.getUri();
-await mongoose.connect(uri, { dbName: 'vignan' });
-check('mongod is running and mongoose connected', mongoose.connection.readyState === 1, uri.replace(/\/\/.*@/, '//'));
+const mongo = await startMongo();
+check('mongod is running and mongoose connected', mongoose.connection.readyState === 1, mongo.uri);
 
 const { Campus, Role, User, Permission } = await import('../src/db/mongo/models.js');
 check('the generated models load', !!User && !!Role);
@@ -79,8 +76,7 @@ const shown = loaded.toJSON();
 check('records are still identified by a string `id`',
   typeof shown.id === 'string' && shown._id === undefined, shown.id);
 
-await mongoose.disconnect();
-await mongod.stop();
+await mongo.stop();
 const failed = results.filter((x) => !x).length;
 console.log(`\n  ${results.length - failed} passed, ${failed} failed\n`);
 process.exit(failed ? 1 : 0);

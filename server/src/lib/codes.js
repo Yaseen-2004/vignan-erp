@@ -25,7 +25,8 @@
  * The unique constraint in the schema remains the real guarantee. This is what
  * keeps the constraint from being hit in the first place.
  */
-import { all } from '../db/connection.js';
+import { byCollection, User } from '../db/mongo/models.js';
+import { startsWith } from '../db/mongo/query.js';
 
 /**
  * An allocator for codes shaped `<prefix><zero-padded number>`.
@@ -39,14 +40,20 @@ import { all } from '../db/connection.js';
  * @param {*}       [spec.scopeValue]
  */
 export async function sequenceAllocator({ table, column, prefix, width, scopeColumn, scopeValue }) {
-  const params = [`${prefix}%`];
-  let sql = `SELECT "${column}" AS code FROM "${table}" WHERE "${column}" LIKE ?`;
-  if (scopeColumn) { sql += ` AND "${scopeColumn}" = ?`; params.push(scopeValue); }
+  const Model = byCollection[table];
+  if (!Model) throw new Error(`No collection named ${table}`);
 
-  // The numbers are read back and compared here rather than in SQL: the suffix
-  // is text, and a code someone typed by hand may not be a number at all.
-  // Postgres would raise on the cast; JavaScript just ignores it.
-  const rows = await all(sql, params);
+  // `LIKE 'prefix%'` becomes an anchored pattern, escaped: a prefix is text,
+  // not a pattern, and one containing a dot would quietly match more than it
+  // should.
+  const filter = { [column]: startsWith(prefix) };
+  if (scopeColumn) filter[scopeColumn] = scopeValue;
+
+  // The numbers are read back and compared here rather than in the query: the
+  // suffix is text, and a code someone typed by hand may not be a number at
+  // all. Comparing as text would make 'VGN9' higher than 'VGN10'.
+  const rows = (await Model.find(filter).select(column).lean())
+    .map((r) => ({ code: r[column] }));
   let highest = 0;
   for (const row of rows) {
     const suffix = String(row.code).slice(prefix.length);
@@ -87,7 +94,7 @@ export async function sequenceAllocator({ table, column, prefix, width, scopeCol
  * rather than exceptional.
  */
 export async function usernameAllocator() {
-  const rows = await all('SELECT username FROM users');
+  const rows = await User.find({}).select('username').lean();
   const taken = new Set(rows.map((r) => String(r.username).toLowerCase()));
 
   return {

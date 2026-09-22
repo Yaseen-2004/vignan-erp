@@ -104,10 +104,17 @@ export async function byId(Model, id, { mapping, select } = {}) {
   return mapping ? lift(doc, mapping) : plain(doc);
 }
 
+/**
+ * Text, made safe to put inside a regular expression.
+ *
+ * A value from the database or from a person is not a pattern. A pupil code of
+ * `VGN.2026` must not match `VGNx2026`, and a stray `(` must not make the query
+ * throw rather than return nothing.
+ */
+export const escapeRegex = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 /** A case-insensitive exact match, for the columns SQL compared with lower(). */
-export const insensitive = (value) => {
-  // Escaped, because a username is not a pattern: someone called `a.b` must
-  // not match `axb`, and a stray `(` must not make the query throw.
-  const escaped = String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return new RegExp(`^${escaped}$`, 'i');
-};
+export const insensitive = (value) => new RegExp(`^${escapeRegex(value)}$`, 'i');
+
+/** Everything beginning with this text — what `LIKE 'x%'` asked for. */
+export const startsWith = (value) => new RegExp(`^${escapeRegex(value)}`);
