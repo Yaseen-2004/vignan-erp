@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { all, get, run, insert, update, scalar, transaction } from '../db/connection.js';
+import { Attendance, Class, Course, CourseAssignment, Faculty, FacultyAttendance, LeaveRequest, Parent, Section, Student, StudentParent } from '../db/mongo/models.js';
+import { sameId } from '../lib/scope.js';
+import { oid, transaction } from '../db/mongo/connection.js';
+import { lift, plain, populateFor } from '../db/mongo/query.js';
 import { asyncHandler, ok, created, pagination, paginated } from '../lib/http.js';
 import { badRequest, notFound, forbidden } from '../lib/errors.js';
 import { requirePermission } from '../middleware/auth.js';
@@ -24,55 +27,53 @@ router.get(
   requirePermission('attendance.view'),
   asyncHandler(async (req, res) => {
     const { page, limit, offset } = pagination(req.query, 50);
-    const clauses = [];
-    const params = [];
+    const filter = {};
 
-    if (!isAdmin(req.user) && req.user.campus_id) {
-      clauses.push('a.campus_id = ?');
-      params.push(req.user.campus_id);
-    }
+    if (!isAdmin(req.user) && req.user.campus_id) filter.campus_id = oid(req.user.campus_id);
+
     const allowed = await accessibleStudentIds(req.user);
     if (allowed !== null) {
       if (!allowed.length) return paginated(res, [], 0, { page, limit });
-      clauses.push(`a.student_id IN (${allowed.map(() => '?').join(',')})`);
-      params.push(...allowed);
+      filter.student_id = { $in: allowed.map(oid).filter(Boolean) };
     }
     for (const field of ['student_id', 'course_id', 'section_id', 'status', 'academic_year_id']) {
       if (req.query[field] && req.query[field] !== 'ALL') {
-        clauses.push(`a.${field} = ?`);
-        params.push(req.query[field]);
+        filter[field] = field.endsWith('_id') ? oid(req.query[field]) : req.query[field];
       }
     }
-    if (req.query.date) {
-      clauses.push('a.attendance_date = ?');
-      params.push(req.query.date);
+    if (req.query.date) filter.attendance_date = req.query.date;
+    if (req.query.from || req.query.to) {
+      const range = {};
+      if (req.query.from) range.$gte = String(req.query.from);
+      if (req.query.to) range.$lte = `${String(req.query.to)}\uffff`;
+      filter.attendance_date = range;
     }
-    if (req.query.from) {
-      clauses.push('substr(a.attendance_date, 1, 10) >= ?');
-      params.push(req.query.from);
-    }
-    if (req.query.to) {
-      clauses.push('substr(a.attendance_date, 1, 10) <= ?');
-      params.push(req.query.to);
-    }
-    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
-    const total = Number(await scalar(`SELECT COUNT(*) AS n FROM attendance a ${where}`, params));
-    const rows = await all(
-      `SELECT a.*, s.first_name, s.last_name, s.admission_number, s.roll_number,
-              co.name AS course_name, sec.name AS section_name, c.name AS class_name,
-              u.full_name AS marked_by_name
-         FROM attendance a
-         JOIN students s ON s.id = a.student_id
-         LEFT JOIN courses co ON co.id = a.course_id
-         LEFT JOIN sections sec ON sec.id = a.section_id
-         LEFT JOIN classes c ON c.id = s.class_id
-         LEFT JOIN users u ON u.id = a.marked_by
-         ${where}
-        ORDER BY a.attendance_date DESC, s.roll_number
-        LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
-    );
+    const MAPPING = {
+      student_id: {
+        first_name: 'first_name', last_name: 'last_name',
+        admission_number: 'admission_number', roll_number: 'roll_number',
+      },
+      'student_id.class_id': { name: 'class_name' },
+      course_id: { name: 'course_name' },
+      section_id: { name: 'section_name' },
+      marked_by: { full_name: 'marked_by_name' },
+    };
+
+    const [docs, total] = await Promise.all([
+      Attendance.find(filter)
+        .populate(populateFor(MAPPING))
+        .sort({ attendance_date: -1 })
+        .skip(offset)
+        .limit(limit),
+      Attendance.countDocuments(filter),
+    ]);
+
+    // The roll breaks ties within a date, and is compared as a number so that
+    // 10 follows 9 rather than 1.
+    const rows = lift(docs, MAPPING)
+      .sort((a, b) => String(b.attendance_date ?? '').localeCompare(String(a.attendance_date ?? ''))
+        || (Number(a.roll_number) || Infinity) - (Number(b.roll_number) || Infinity));
     return paginated(res, rows, total, { page, limit });
   })
 );
@@ -85,7 +86,7 @@ router.get(
   '/register',
   requirePermission('attendance.view'),
   asyncHandler(async (req, res) => {
-    const sectionId = Number(req.query.section_id);
+    const sectionId = req.query.section_id;
     const courseId = req.query.course_id ? Number(req.query.course_id) : null;
     const date = req.query.date || new Date().toISOString().slice(0, 10);
     const period = Number(req.query.period || 0);
@@ -94,30 +95,49 @@ router.get(
     // Assignment check — a teacher may only open their own register.
     if (isTeacher(req.user)) {
       const facultyId = await facultyIdOf(req.user);
-      const assigned = await get(
-        `SELECT 1 AS ok FROM course_assignments
-          WHERE faculty_id = ? AND section_id = ? AND status = 'ACTIVE'${courseId ? ' AND course_id = ?' : ''}`,
-        courseId ? [facultyId ?? 0, sectionId, courseId] : [facultyId ?? 0, sectionId]
-      );
+      const assigned = await CourseAssignment.exists({
+        faculty_id: oid(facultyId),
+        section_id: oid(sectionId),
+        status: 'ACTIVE',
+        ...(courseId ? { course_id: oid(courseId) } : {}),
+      });
       if (!assigned) throw forbidden('This class is not assigned to you');
     }
 
-    const students = await all(
-      `SELECT s.id, s.admission_number, s.roll_number, s.first_name, s.last_name, s.photo,
-              a.id AS attendance_id, a.status, a.remarks
-         FROM students s
-         LEFT JOIN attendance a
-           ON a.student_id = s.id AND a.attendance_date = ? AND a.period = ?
-          AND ${courseId ? 'a.course_id = ?' : 'a.course_id IS NULL'}
-        WHERE s.section_id = ? AND s.status = 'ACTIVE'
-        ORDER BY (CASE WHEN s.roll_number ~ '^[0-9]+$' THEN s.roll_number::int ELSE NULL END), s.first_name`,
-      courseId ? [date, period, courseId, sectionId] : [date, period, sectionId]
+    /*
+     * Every pupil in the section, with whatever has already been marked for
+     * this date and period beside them. The LEFT JOIN is what made it "every
+     * pupil" rather than "every pupil already marked" — a register that only
+     * listed the ones already recorded would be useless for taking it.
+     */
+    const pupils = plain(
+      await Student.find({ section_id: oid(sectionId), status: 'ACTIVE' })
+        .select('admission_number roll_number first_name last_name photo')
     );
 
-    const section = await get(
-      `SELECT sec.*, c.name AS class_name FROM sections sec JOIN classes c ON c.id = sec.class_id WHERE sec.id = ?`,
-      [sectionId]
-    );
+    const marks = await Attendance.find({
+      student_id: { $in: pupils.map((x) => oid(x.id)) },
+      attendance_date: date,
+      period,
+      // A register for a particular lesson, or the day's own register.
+      course_id: courseId ? oid(courseId) : null,
+    }).select('student_id status remarks').lean();
+    const markFor = new Map(marks.map((m) => [String(m.student_id), m]));
+
+    const students = pupils
+      .map((pupil) => ({
+        ...pupil,
+        attendance_id: markFor.has(pupil.id) ? String(markFor.get(pupil.id)._id) : null,
+        status: markFor.get(pupil.id)?.status ?? null,
+        remarks: markFor.get(pupil.id)?.remarks ?? null,
+      }))
+      // By roll as a number, then by name — a roll that is not a number sorts
+      // last, as the CASE made NULL do.
+      .sort((a, b) => (Number(a.roll_number) || Infinity) - (Number(b.roll_number) || Infinity)
+        || String(a.first_name ?? '').localeCompare(String(b.first_name ?? '')));
+
+    const sectionDoc = await Section.findById(oid(sectionId)).populate('class_id', 'name');
+    const section = sectionDoc ? lift(sectionDoc, { class_id: { name: 'class_name' } }) : null;
     return ok(res, { date, period, course_id: courseId, section, students, marked: students.some((s) => s.attendance_id) });
   })
 );
@@ -134,44 +154,43 @@ router.get(
   '/previous',
   requirePermission('attendance.view'),
   asyncHandler(async (req, res) => {
-    const sectionId = Number(req.query.section_id);
+    const sectionId = req.query.section_id;
     const date = req.query.date || new Date().toISOString().slice(0, 10);
     const period = Number(req.query.period || 0);
     if (!sectionId) throw badRequest('section_id is required');
 
     if (isTeacher(req.user)) {
       const facultyId = await facultyIdOf(req.user);
-      const assigned = await get(
-        `SELECT 1 AS ok FROM course_assignments WHERE faculty_id = ? AND section_id = ? AND status = 'ACTIVE'`,
-        [facultyId ?? 0, sectionId]
-      );
+      const assigned = await CourseAssignment.exists({
+        faculty_id: oid(facultyId),
+        section_id: oid(sectionId),
+        status: 'ACTIVE',
+      });
       if (!assigned) throw forbidden('This class is not assigned to you');
     }
 
     // The nearest earlier period that actually has records.
-    const source = await get(
-      `SELECT a.period, a.course_id, COUNT(*) AS marked
-         FROM attendance a
-        WHERE a.section_id = ? AND a.attendance_date = ? AND a.period < ?
-        GROUP BY a.period, a.course_id
-        ORDER BY a.period DESC LIMIT 1`,
-      [sectionId, date, period]
-    );
+    const [source] = await Attendance.aggregate([
+      { $match: { section_id: oid(sectionId), attendance_date: date, period: { $lt: period } } },
+      { $group: { _id: { period: '$period', course_id: '$course_id' }, marked: { $sum: 1 } } },
+      { $sort: { '_id.period': -1 } },
+      { $limit: 1 },
+    ]).then((rows) => rows.map((r) => ({ period: r._id.period, course_id: r._id.course_id, marked: r.marked })));
 
     if (!source) {
       return ok(res, { found: false, period: null, records: [] });
     }
 
-    const records = await all(
-      `SELECT a.student_id, a.status, a.remarks
-         FROM attendance a
-        WHERE a.section_id = ? AND a.attendance_date = ? AND a.period = ?
-          AND ${source.course_id ? 'a.course_id = ?' : 'a.course_id IS NULL'}`,
-      source.course_id ? [sectionId, date, source.period, source.course_id] : [sectionId, date, source.period]
-    );
+    const records = (await Attendance.find({
+      section_id: oid(sectionId),
+      attendance_date: date,
+      period: source.period,
+      course_id: source.course_id ?? null,
+    }).select('student_id status remarks').lean())
+      .map((r) => ({ student_id: String(r.student_id), status: r.status, remarks: r.remarks }));
 
     const course = source.course_id
-      ? await get('SELECT name FROM courses WHERE id = ?', [source.course_id])
+      ? await Course.findById(source.course_id).select('name').lean()
       : null;
 
     return ok(res, {
@@ -215,72 +234,104 @@ router.post(
 
     if (isTeacher(req.user)) {
       const facultyId = await facultyIdOf(req.user);
-      const assigned = await get(
-        `SELECT 1 AS ok FROM course_assignments
-          WHERE faculty_id = ? AND section_id = ? AND status = 'ACTIVE'${course_id ? ' AND course_id = ?' : ''}`,
-        course_id ? [facultyId ?? 0, section_id, course_id] : [facultyId ?? 0, section_id]
-      );
+      const assigned = await CourseAssignment.exists({
+        faculty_id: oid(facultyId),
+        section_id: oid(section_id),
+        status: 'ACTIVE',
+        ...(course_id ? { course_id: oid(course_id) } : {}),
+      });
       if (!assigned) throw forbidden('You may only mark attendance for classes assigned to you');
     }
 
     const sectionStudents = new Set(
-      (await all(`SELECT id FROM students WHERE section_id = ? AND status = 'ACTIVE'`, [section_id])).map((r) => r.id)
+      (await Student.find({ section_id: oid(section_id), status: 'ACTIVE' }).select('_id').lean())
+        .map((r) => String(r._id))
     );
     const campusId = req.user.campus_id;
 
-    const summary = await transaction(async () => {
+    /*
+     * The whole register is one unit. Half a class marked is worse than none:
+     * the teacher believes it is done, and the pupils in the unwritten half
+     * show as never having been recorded.
+     */
+    const summary = await transaction(async (session) => {
+      const opts = session ? { session } : {};
       let inserted = 0;
       let updated = 0;
       const absentees = [];
 
       for (const record of records) {
-        if (!sectionStudents.has(record.student_id)) continue; // silently skip foreign students
+        // Silently skip a pupil who is not in this section.
+        if (!sectionStudents.has(String(record.student_id))) continue;
 
-        const existing = await get(
-          `SELECT * FROM attendance WHERE student_id = ? AND attendance_date = ? AND period = ?
-             AND ${course_id ? 'course_id = ?' : 'course_id IS NULL'}`,
-          course_id
-            ? [record.student_id, attendance_date, period, course_id]
-            : [record.student_id, attendance_date, period]
+        /*
+         * Written as one upsert rather than a read then a write. Two teachers
+         * marking the same lesson would both find nothing and both insert,
+         * leaving the same pupil recorded twice for one period — the unique
+         * key refused that, and matching on the same four fields does too.
+         */
+        const key = {
+          student_id: oid(record.student_id),
+          attendance_date,
+          period,
+          course_id: course_id ? oid(course_id) : null,
+        };
+        const result = await Attendance.updateOne(
+          key,
+          {
+            $set: {
+              status: record.status,
+              remarks: record.remarks ?? null,
+              marked_by: oid(req.user.id),
+            },
+            $setOnInsert: {
+              campus_id: oid(campusId),
+              section_id: oid(section_id),
+              academic_year_id: oid(academic_year_id),
+            },
+          },
+          { ...opts, upsert: true }
         );
 
-        if (existing) {
-          await run(
-            `UPDATE attendance SET status = ?, remarks = ?, marked_by = ?, updated_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?`,
-            [record.status, record.remarks ?? null, req.user.id, existing.id]
-          );
-          updated += 1;
-        } else {
-          await insert('attendance', {
-            campus_id: campusId,
-            student_id: record.student_id,
-            course_id: course_id ?? null,
-            section_id,
-            academic_year_id: academic_year_id ?? null,
-            attendance_date,
-            period,
-            status: record.status,
-            remarks: record.remarks ?? null,
-            marked_by: req.user.id,
-          });
-          inserted += 1;
-        }
+        if (result.upsertedCount) inserted += 1;
+        else updated += 1;
         if (record.status === 'ABSENT') absentees.push(record.student_id);
       }
       return { inserted, updated, absentees };
-    })();
+    });
 
     // Tell the parents of absent children.
+    // Resolved for the whole class at once rather than per absent child.
+    const absentIds = summary.absentees.map(oid).filter(Boolean);
+    const absentPupils = absentIds.length
+      ? await Student.find({ _id: { $in: absentIds } }).select('first_name last_name').lean()
+      : [];
+    const pupilFor = new Map(absentPupils.map((x) => [String(x._id), x]));
+
+    const links = absentIds.length
+      ? await StudentParent.find({ student_id: { $in: absentIds } }).select('student_id parent_id').lean()
+      : [];
+    const families = links.length
+      ? await Parent.find({ _id: { $in: links.map((l) => l.parent_id) }, user_id: { $ne: null } })
+        .select('user_id').lean()
+      : [];
+    const accountFor = new Map(families.map((f) => [String(f._id), f.user_id]));
+
+    const parentsOf = new Map();
+    for (const link of links) {
+      const account = accountFor.get(String(link.parent_id));
+      if (!account) continue;
+      const key = String(link.student_id);
+      if (!parentsOf.has(key)) parentsOf.set(key, []);
+      parentsOf.get(key).push(account);
+    }
+
     for (const studentId of summary.absentees) {
-      const parentUsers = await all(
-        `SELECT p.user_id FROM student_parents sp JOIN parents p ON p.id = sp.parent_id
-          WHERE sp.student_id = ? AND p.user_id IS NOT NULL`,
-        [studentId]
-      );
-      const student = await get('SELECT first_name, last_name FROM students WHERE id = ?', [studentId]);
-      for (const parent of parentUsers) {
+      const student = pupilFor.get(String(studentId));
+      if (!student) continue;
+      for (const account of parentsOf.get(String(studentId)) ?? []) {
         await notify({
-          userId: parent.user_id,
+          userId: String(account),
           campusId,
           type: 'ATTENDANCE',
           title: 'Absence recorded',
@@ -311,43 +362,56 @@ router.get(
   '/summary/:studentId',
   requirePermission('attendance.view'),
   asyncHandler(async (req, res) => {
-    const studentId = Number(req.params.studentId);
+    const studentId = req.params.studentId;
     await assertStudentAccess(req.user, studentId);
 
-    const overall = await get(
-      `SELECT COUNT(*) AS total,
-              SUM(CASE WHEN status = 'PRESENT' THEN 1 ELSE 0 END) AS present,
-              SUM(CASE WHEN status = 'ABSENT'  THEN 1 ELSE 0 END) AS absent
-         FROM attendance WHERE student_id = ?`,
-      [studentId]
-    );
+    const mine = { student_id: oid(studentId) };
+    const presence = {
+      total: { $sum: 1 },
+      present: { $sum: { $cond: [{ $eq: ['$status', 'PRESENT'] }, 1, 0] } },
+    };
 
-    const monthly = await all(
-      `SELECT substr(attendance_date, 1, 7) AS month,
-              COUNT(*) AS total,
-              SUM(CASE WHEN status = 'PRESENT' THEN 1 ELSE 0 END) AS present
-         FROM attendance WHERE student_id = ?
-        GROUP BY month ORDER BY month DESC LIMIT 12`,
-      [studentId]
-    );
+    const [overallRow] = await Attendance.aggregate([
+      { $match: mine },
+      { $group: { _id: null, ...presence, absent: { $sum: { $cond: [{ $eq: ['$status', 'ABSENT'] }, 1, 0] } } } },
+    ]);
+    const overall = overallRow || { total: 0, present: 0, absent: 0 };
 
-    const bySubject = await all(
-      `SELECT co.id AS course_id, co.name AS course_name, sub.name AS subject_name,
-              COUNT(*) AS total,
-              SUM(CASE WHEN a.status = 'PRESENT' THEN 1 ELSE 0 END) AS present
-         FROM attendance a
-         JOIN courses co ON co.id = a.course_id
-         JOIN subjects sub ON sub.id = co.subject_id
-        WHERE a.student_id = ?
-        GROUP BY co.id, sub.id ORDER BY sub.name`,
-      [studentId]
-    );
+    // By month: the first seven characters of the date, as substr() took.
+    const monthly = (await Attendance.aggregate([
+      { $match: mine },
+      { $group: { _id: { $substrBytes: ['$attendance_date', 0, 7] }, ...presence } },
+      { $sort: { _id: -1 } },
+      { $limit: 12 },
+    ])).map((m) => ({ month: m._id, total: m.total, present: m.present }));
 
-    const recent = await all(
-      `SELECT a.attendance_date, a.status, a.period, a.remarks, co.name AS course_name
-         FROM attendance a LEFT JOIN courses co ON co.id = a.course_id
-        WHERE a.student_id = ? ORDER BY a.attendance_date DESC LIMIT 30`,
-      [studentId]
+    // By subject — only lessons, since a day's register carries no course.
+    const byCourse = await Attendance.aggregate([
+      { $match: { ...mine, course_id: { $ne: null } } },
+      { $group: { _id: '$course_id', ...presence } },
+    ]);
+    const courses = byCourse.length
+      ? await Course.find({ _id: { $in: byCourse.map((c) => c._id) } })
+        .select('name subject_id').populate('subject_id', 'name')
+      : [];
+    const courseFor = new Map(courses.map((c) => [String(c._id), c]));
+    const bySubject = byCourse
+      .map((c) => ({
+        course_id: String(c._id),
+        course_name: courseFor.get(String(c._id))?.name ?? null,
+        subject_name: courseFor.get(String(c._id))?.subject_id?.name ?? null,
+        total: c.total,
+        present: c.present,
+      }))
+      .sort((a, b) => String(a.subject_name ?? '').localeCompare(String(b.subject_name ?? '')));
+
+    const recent = lift(
+      await Attendance.find(mine)
+        .select('attendance_date status period remarks course_id')
+        .populate('course_id', 'name')
+        .sort({ attendance_date: -1 })
+        .limit(30),
+      { course_id: { name: 'course_name' } }
     );
 
     const pct = (present, total) => (total ? Number(((present / total) * 100).toFixed(2)) : 0);
@@ -367,38 +431,71 @@ router.get(
   asyncHandler(async (req, res) => {
     const date = req.query.date || new Date().toISOString().slice(0, 10);
     const campusId = req.user.campus_id;
-    const scope = isAdmin(req.user) && !campusId ? '' : ' AND a.campus_id = ?';
-    const params = scope ? [date, campusId] : [date];
+    const scope = isAdmin(req.user) && !campusId ? {} : { campus_id: oid(campusId) };
+    const today = { ...scope, attendance_date: date };
+    const presence = {
+      total: { $sum: 1 },
+      present: { $sum: { $cond: [{ $eq: ['$status', 'PRESENT'] }, 1, 0] } },
+    };
 
-    const totals = await get(
-      `SELECT COUNT(DISTINCT a.student_id) AS marked,
-              SUM(CASE WHEN a.status = 'PRESENT' THEN 1 ELSE 0 END) AS present,
-              SUM(CASE WHEN a.status = 'ABSENT'  THEN 1 ELSE 0 END) AS absent
-         FROM attendance a WHERE a.attendance_date = ?${scope}`,
-      params
-    );
+    /*
+     * COUNT(DISTINCT student_id): a pupil marked in five lessons is one pupil
+     * marked, not five. Counting the records would report a class of thirty as
+     * a hundred and fifty.
+     */
+    const [totalsRow] = await Attendance.aggregate([
+      { $match: today },
+      {
+        $group: {
+          _id: null,
+          pupils: { $addToSet: '$student_id' },
+          present: { $sum: { $cond: [{ $eq: ['$status', 'PRESENT'] }, 1, 0] } },
+          absent: { $sum: { $cond: [{ $eq: ['$status', 'ABSENT'] }, 1, 0] } },
+        },
+      },
+    ]);
+    const totals = {
+      marked: totalsRow?.pupils?.length ?? 0,
+      present: totalsRow?.present ?? 0,
+      absent: totalsRow?.absent ?? 0,
+    };
 
-    const byClass = await all(
-      `SELECT c.id, c.name AS class_name, sec.name AS section_name,
-              COUNT(*) AS total,
-              SUM(CASE WHEN a.status = 'PRESENT' THEN 1 ELSE 0 END) AS present
-         FROM attendance a
-         JOIN students s ON s.id = a.student_id
-         JOIN classes c ON c.id = s.class_id
-         LEFT JOIN sections sec ON sec.id = s.section_id
-        WHERE a.attendance_date = ?${scope}
-        GROUP BY c.id, sec.id ORDER BY c.numeric_level, sec.name`,
-      params
-    );
+    // Grouped by the pupil's class and section, which belong to the pupil
+    // rather than to the record — which is why the pupil is joined in.
+    const grouped = await Attendance.aggregate([
+      { $match: today },
+      { $lookup: { from: 'students', localField: 'student_id', foreignField: '_id', as: 'pupil' } },
+      { $unwind: '$pupil' },
+      { $group: { _id: { class_id: '$pupil.class_id', section_id: '$pupil.section_id' }, ...presence } },
+    ]);
 
-    const trend = await all(
-      `SELECT a.attendance_date AS date, COUNT(*) AS total,
-              SUM(CASE WHEN a.status = 'PRESENT' THEN 1 ELSE 0 END) AS present
-         FROM attendance a
-        WHERE substr(a.attendance_date, 1, 10) >= date(?, '-14 days')${scope}
-        GROUP BY a.attendance_date ORDER BY a.attendance_date`,
-      params
-    );
+    const classes = await Class.find({ _id: { $in: grouped.map((g) => g._id.class_id).filter(Boolean) } })
+      .select('name numeric_level').lean();
+    const classFor = new Map(classes.map((c) => [String(c._id), c]));
+    const sections = await Section.find({ _id: { $in: grouped.map((g) => g._id.section_id).filter(Boolean) } })
+      .select('name').lean();
+    const sectionFor = new Map(sections.map((x) => [String(x._id), x.name]));
+
+    const byClass = grouped
+      .map((g) => ({
+        id: String(g._id.class_id),
+        class_name: classFor.get(String(g._id.class_id))?.name ?? null,
+        section_name: sectionFor.get(String(g._id.section_id)) ?? null,
+        total: g.total,
+        present: g.present,
+        _level: classFor.get(String(g._id.class_id))?.numeric_level ?? 0,
+      }))
+      .sort((a, b) => a._level - b._level
+        || String(a.section_name ?? '').localeCompare(String(b.section_name ?? '')))
+      .map(({ _level, ...row }) => row);
+
+    // The fortnight up to the chosen day.
+    const since = new Date(new Date(date).getTime() - 14 * 86400000).toISOString().slice(0, 10);
+    const trend = (await Attendance.aggregate([
+      { $match: { ...scope, attendance_date: { $gte: since } } },
+      { $group: { _id: '$attendance_date', ...presence } },
+      { $sort: { _id: 1 } },
+    ])).map((t) => ({ date: t._id, total: t.total, present: t.present }));
 
     return ok(res, {
       date,
@@ -414,22 +511,23 @@ const facultyAttendanceRouter = createResourceRouter({
   table: 'faculty_attendance',
   module: 'faculty_attendance',
   entityType: 'Faculty Attendance',
-  alias: 'fa',
-  select: `fa.*, u.full_name AS faculty_name, f.faculty_code, f.staff_type, d.name AS department_name`,
-  joins: `JOIN faculty f ON f.id = fa.faculty_id
-          JOIN users u ON u.id = f.user_id
-          LEFT JOIN departments d ON d.id = f.department_id`,
-  searchable: ['u.full_name', 'f.faculty_code'],
+  populate: {
+    faculty_id: { faculty_code: 'faculty_code', staff_type: 'staff_type' },
+    'faculty_id.user_id': { full_name: 'faculty_name' },
+    'faculty_id.department_id': { name: 'department_name' },
+  },
+  searchable: [],
   filterable: ['faculty_id', 'status', 'attendance_date'],
   sortable: ['id', 'attendance_date'],
   required: ['faculty_id', 'attendance_date', 'status'],
   defaultSort: 'attendance_date',
   beforeCreate: (data, req) => ({ ...data, marked_by: req.user.id }),
   // Faculty may only read their own attendance unless they can manage it.
-  scopeClause: async (req) => {
+  scopeFilter: async (req) => {
     if (req.permissions.has('faculty_attendance.edit') || isAdmin(req.user)) return null;
     const facultyId = await facultyIdOf(req.user);
-    return { clause: 'fa.faculty_id = ?', params: [facultyId ?? 0] };
+    // Somebody with no faculty record of their own sees none, not all.
+    return facultyId ? { faculty_id: oid(facultyId) } : { $expr: { $eq: [1, 0] } };
   },
 });
 
@@ -457,43 +555,43 @@ facultyAttendanceRouter.post(
     const { attendance_date, records } = req.body;
     const campusId = req.user.campus_id;
 
-    const summary = await transaction(async () => {
+    // Everyone named, fetched once rather than one at a time inside the loop.
+    const staff = await Faculty.find({ _id: { $in: records.map((r) => oid(r.faculty_id)).filter(Boolean) } })
+      .select('campus_id').lean();
+    const staffFor = new Map(staff.map((f) => [String(f._id), f]));
+
+    const summary = await transaction(async (session) => {
+      const opts = session ? { session } : {};
       let inserted = 0;
       let updated = 0;
-      for (const record of records) {
-        const faculty = await get('SELECT * FROM faculty WHERE id = ?', [record.faculty_id]);
-        if (!faculty) continue;
-        if (!isAdmin(req.user) && faculty.campus_id !== campusId) continue;
 
-        const existing = await get('SELECT id FROM faculty_attendance WHERE faculty_id = ? AND attendance_date = ?', [
-          record.faculty_id,
-          attendance_date,
-        ]);
-        if (existing) {
-          await update('faculty_attendance', existing.id, {
-            status: record.status,
-            check_in: record.check_in,
-            check_out: record.check_out,
-            remarks: record.remarks,
-            marked_by: req.user.id,
-          });
-          updated += 1;
-        } else {
-          await insert('faculty_attendance', {
-            campus_id: faculty.campus_id,
-            faculty_id: record.faculty_id,
-            attendance_date,
-            status: record.status,
-            check_in: record.check_in,
-            check_out: record.check_out,
-            remarks: record.remarks,
-            marked_by: req.user.id,
-          });
-          inserted += 1;
-        }
+      for (const record of records) {
+        const faculty = staffFor.get(String(record.faculty_id));
+        if (!faculty) continue;
+        if (!isAdmin(req.user) && !sameId(faculty.campus_id, campusId)) continue;
+
+        // One upsert on the pair that must be unique — a person and a day —
+        // rather than a read followed by a write that could race with itself.
+        const result = await FacultyAttendance.updateOne(
+          { faculty_id: oid(record.faculty_id), attendance_date },
+          {
+            $set: {
+              status: record.status,
+              check_in: record.check_in,
+              check_out: record.check_out,
+              remarks: record.remarks,
+              marked_by: oid(req.user.id),
+            },
+            $setOnInsert: { campus_id: faculty.campus_id },
+          },
+          { ...opts, upsert: true }
+        );
+
+        if (result.upsertedCount) inserted += 1;
+        else updated += 1;
       }
       return { inserted, updated };
-    })();
+    });
 
     await logActivity({
       req,
@@ -570,42 +668,45 @@ leaveRouter.post(
     })
   ),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const leave = await get('SELECT * FROM leave_requests WHERE id = ?', [id]);
+    const id = req.params.id;
+    const leave = plain(await LeaveRequest.findById(oid(id)));
     if (!leave) throw notFound('Leave request not found');
-    if (!isAdmin(req.user) && leave.campus_id !== req.user.campus_id) throw forbidden('Different campus');
+    if (!isAdmin(req.user) && !sameId(leave.campus_id, req.user.campus_id)) throw forbidden('Different campus');
     if (leave.status !== 'PENDING') throw badRequest(`This request has already been ${leave.status.toLowerCase()}`);
 
-    await update('leave_requests', id, {
-      status: req.body.status,
-      reviewed_by: req.user.id,
-      reviewed_at: new Date().toISOString(),
-      review_remarks: req.body.review_remarks,
+    await LeaveRequest.updateOne({ _id: oid(id) }, {
+      $set: {
+        status: req.body.status,
+        reviewed_by: oid(req.user.id),
+        reviewed_at: new Date().toISOString(),
+        review_remarks: req.body.review_remarks,
+      },
     });
 
-    // Approved student leave is reflected in the attendance register.
+    // Approved pupil leave is reflected in the attendance register.
     if (req.body.status === 'APPROVED' && leave.requester_type === 'STUDENT' && leave.student_id) {
-      const student = await get('SELECT * FROM students WHERE id = ?', [leave.student_id]);
+      const student = await Student.findById(oid(leave.student_id)).select('section_id').lean();
+
+      /*
+       * One upsert per day of the leave, on the same four fields the register
+       * itself uses. A day already marked is corrected rather than doubled —
+       * which is what the read-then-write did, without the gap between them.
+       */
       let cursor = new Date(leave.from_date);
       const end = new Date(leave.to_date);
       while (cursor <= end) {
         const day = cursor.toISOString().slice(0, 10);
-        const existing = await get(
-          `SELECT id FROM attendance WHERE student_id = ? AND attendance_date = ? AND period = 0 AND course_id IS NULL`,
-          [leave.student_id, day]
+        await Attendance.updateOne(
+          { student_id: oid(leave.student_id), attendance_date: day, period: 0, course_id: null },
+          {
+            $set: { status: 'ABSENT', remarks: 'Approved leave', marked_by: oid(req.user.id) },
+            $setOnInsert: {
+              campus_id: oid(leave.campus_id),
+              section_id: student?.section_id ?? null,
+            },
+          },
+          { upsert: true }
         );
-        if (existing) await update('attendance', existing.id, { status: 'ABSENT', remarks: 'Approved leave', marked_by: req.user.id });
-        else
-          await insert('attendance', {
-            campus_id: leave.campus_id,
-            student_id: leave.student_id,
-            section_id: student?.section_id ?? null,
-            attendance_date: day,
-            period: 0,
-            status: 'ABSENT',
-            remarks: 'Approved leave',
-            marked_by: req.user.id,
-          });
         cursor = new Date(cursor.getTime() + 86400000);
       }
     }
@@ -634,7 +735,7 @@ leaveRouter.post(
       newValues: { status: req.body.status, remarks: req.body.review_remarks },
     });
 
-    return ok(res, await get('SELECT * FROM leave_requests WHERE id = ?', [id]));
+    return ok(res, plain(await LeaveRequest.findById(oid(id))));
   })
 );
 router.use('/leave', leaveRouter);
