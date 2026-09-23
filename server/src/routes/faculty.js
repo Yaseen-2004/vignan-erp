@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { all, get, run, insert, update, scalar, transaction } from '../db/connection.js';
+import { ActivityLog, CourseAssignment, Document, Faculty, FacultyAttendance, LeaveRequest, Payroll, Role, SalaryStructure, Student, Timetable, User } from '../db/mongo/models.js';
+import { oid, transaction } from '../db/mongo/connection.js';
+import { escapeRegex, insensitive, lift, plain, populateFor } from '../db/mongo/query.js';
 import { asyncHandler, ok, created, pagination, paginated, safeSort } from '../lib/http.js';
 import { badRequest, notFound, conflict, forbidden } from '../lib/errors.js';
 import { requirePermission } from '../middleware/auth.js';
@@ -9,7 +11,7 @@ import { photoUpload, documentUpload, publicPath } from '../middleware/upload.js
 import { heavyLimiter } from '../middleware/ratelimit.js';
 import { hashPassword } from '../lib/auth.js';
 import { logActivity, diff } from '../lib/audit.js';
-import { isAdmin, isStaff, facultyIdOf } from '../lib/scope.js';
+import { isAdmin, isStaff, facultyIdOf, sameId} from '../lib/scope.js';
 import env from '../config/env.js';
 import { facultyCodes } from '../lib/codes.js';
 
@@ -41,16 +43,55 @@ const facultySchema = z.object({
   status: z.enum(['ACTIVE', 'INACTIVE', 'ON_LEAVE', 'RESIGNED']).optional(),
 });
 
-const SELECT_FACULTY = `
-  f.*, u.full_name, u.email, u.phone, u.photo, u.username, u.gender, u.status AS account_status,
-  d.name AS department_name, r.code AS role_code,
-  (SELECT COUNT(*) FROM course_assignments ca WHERE ca.faculty_id = f.id AND ca.status = 'ACTIVE') AS assigned_courses,
-  (SELECT COUNT(*) FROM students s WHERE s.mentor_id = f.id AND s.status = 'ACTIVE') AS mentee_count`;
+/** What the joins lifted from the account, its role and the department. */
+const JOINED = {
+  user_id: {
+    full_name: 'full_name', email: 'email', phone: 'phone', photo: 'photo',
+    username: 'username', gender: 'gender', status: 'account_status',
+  },
+  'user_id.role_id': { code: 'role_code' },
+  department_id: { name: 'department_name' },
+};
 
-const JOIN_FACULTY = `
-  JOIN users u ON u.id = f.user_id
-  JOIN roles r ON r.id = u.role_id
-  LEFT JOIN departments d ON d.id = f.department_id`;
+/**
+ * Courses assigned and mentees held, for these members of staff.
+ *
+ * Two correlated subqueries per row became two grouped queries per page.
+ */
+async function workloadFor(facultyIds) {
+  const ids = facultyIds.map(oid).filter(Boolean);
+  if (!ids.length) return new Map();
+  const countBy = async (Model, field) => {
+    const rows = await Model.aggregate([
+      { $match: { [field]: { $in: ids }, status: 'ACTIVE' } },
+      { $group: { _id: `$${field}`, n: { $sum: 1 } } },
+    ]);
+    return new Map(rows.map((r) => [String(r._id), r.n]));
+  };
+  const [courses, mentees] = await Promise.all([
+    countBy(CourseAssignment, 'faculty_id'),
+    countBy(Student, 'mentor_id'),
+  ]);
+  const out = new Map();
+  for (const id of ids) {
+    out.set(String(id), {
+      assigned_courses: courses.get(String(id)) ?? 0,
+      mentee_count: mentees.get(String(id)) ?? 0,
+    });
+  }
+  return out;
+}
+
+/** One member of staff, in the shape the joins produced. */
+async function loadFacultyRow(id) {
+  const _id = oid(id);
+  if (!_id) return null;
+  const doc = await Faculty.findById(_id).populate(populateFor(JOINED));
+  if (!doc) return null;
+  const row = lift(doc, JOINED);
+  Object.assign(row, (await workloadFor([row.id])).get(row.id) ?? {});
+  return row;
+}
 
 const roleForStaffType = (staffType) => (staffType === 'TEACHING' ? 'TEACHING_STAFF' : 'FINANCIAL_STAFF');
 
@@ -74,41 +115,46 @@ router.get(
     const { page, limit, offset } = pagination(req.query);
     const { column, direction } = safeSort(req.query, ['id', 'faculty_code', 'date_of_joining', 'created_at'], 'id');
 
-    const clauses = [];
-    const params = [];
-    if (!isAdmin(req.user) && req.user.campus_id) {
-      clauses.push('f.campus_id = ?');
-      params.push(req.user.campus_id);
-    }
+    const filter = {};
+    if (!isAdmin(req.user) && req.user.campus_id) filter.campus_id = oid(req.user.campus_id);
     for (const field of ['staff_type', 'department_id', 'status', 'is_mentor']) {
       const value = req.query[field];
       if (value !== undefined && value !== '' && value !== 'ALL') {
-        clauses.push(`f.${field} = ?`);
-        params.push(value);
+        filter[field] = field.endsWith('_id') ? oid(value) : value;
       }
     }
-    // Filtering by department also returns staff who serve both wings.
-    if (req.query.board && req.query.board !== 'ALL') {
-      if (req.query.board === 'BOTH') {
-        clauses.push("f.board = 'BOTH'");
-      } else {
-        clauses.push("(f.board = ? OR f.board = 'BOTH')");
-        params.push(req.query.board);
-      }
-    }
-    if (req.query.search) {
-      const term = `%${req.query.search}%`;
-      clauses.push('(u.full_name ILIKE ? OR f.faculty_code ILIKE ? OR u.email ILIKE ? OR f.designation ILIKE ?)');
-      params.push(term, term, term, term);
-    }
-    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
-    const total = Number(await scalar(`SELECT COUNT(*) AS n FROM faculty f JOIN users u ON u.id = f.user_id ${where}`, params));
-    const rows = await all(
-      `SELECT ${SELECT_FACULTY} FROM faculty f ${JOIN_FACULTY} ${where}
-        ORDER BY f.${column} ${direction} LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
-    );
+    // Asking for one wing also returns the staff who serve both; asking for
+    // BOTH means only those.
+    if (req.query.board && req.query.board !== 'ALL') {
+      filter.board = req.query.board === 'BOTH' ? 'BOTH' : { $in: [req.query.board, 'BOTH'] };
+    }
+
+    // The name and email live on the account, which the join reached.
+    if (req.query.search) {
+      const term = new RegExp(escapeRegex(String(req.query.search)), 'i');
+      const accounts = await User.find({ $or: [{ full_name: term }, { email: term }] })
+        .select('_id').lean();
+      filter.$or = [
+        { faculty_code: term },
+        { designation: term },
+        { user_id: { $in: accounts.map((u) => u._id) } },
+      ];
+    }
+
+    const sortField = column === 'id' ? '_id' : column;
+    const [docs, total] = await Promise.all([
+      Faculty.find(filter)
+        .populate(populateFor(JOINED))
+        .sort({ [sortField]: direction === 'ASC' ? 1 : -1, _id: 1 })
+        .skip(offset)
+        .limit(limit),
+      Faculty.countDocuments(filter),
+    ]);
+
+    const rows = lift(docs, JOINED);
+    const workload = await workloadFor(rows.map((r) => r.id));
+    for (const row of rows) Object.assign(row, workload.get(row.id) ?? {});
     return paginated(res, rows, total, { page, limit });
   })
 );
@@ -118,9 +164,9 @@ router.get(
   '/:id',
   requirePermission('faculty.view'),
   asyncHandler(async (req, res) => {
-    const row = await get(`SELECT ${SELECT_FACULTY} FROM faculty f ${JOIN_FACULTY} WHERE f.id = ?`, [Number(req.params.id)]);
+    const row = await loadFacultyRow(req.params.id);
     if (!row) throw notFound('Faculty member not found');
-    if (!isAdmin(req.user) && row.campus_id !== req.user.campus_id) throw forbidden('Different campus');
+    if (!isAdmin(req.user) && !sameId(row.campus_id, req.user.campus_id)) throw forbidden('Different campus');
     return ok(res, row);
   })
 );
@@ -130,77 +176,96 @@ router.get(
   '/:id/profile',
   requirePermission('faculty.view'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const faculty = await get(`SELECT ${SELECT_FACULTY} FROM faculty f ${JOIN_FACULTY} WHERE f.id = ?`, [id]);
+    const id = req.params.id;
+    const faculty = await loadFacultyRow(id);
     if (!faculty) throw notFound('Faculty member not found');
-    if (!isAdmin(req.user) && faculty.campus_id !== req.user.campus_id) throw forbidden('Different campus');
+    if (!isAdmin(req.user) && !sameId(faculty.campus_id, req.user.campus_id)) throw forbidden('Different campus');
 
-    const assignments = await all(
-      `SELECT ca.id, co.code AS course_code, co.name AS course_name, sub.name AS subject_name,
-              c.name AS class_name, sec.name AS section_name, ca.status
-         FROM course_assignments ca
-         JOIN courses co ON co.id = ca.course_id
-         JOIN subjects sub ON sub.id = co.subject_id
-         JOIN sections sec ON sec.id = ca.section_id
-         JOIN classes c ON c.id = sec.class_id
-        WHERE ca.faculty_id = ? ORDER BY c.name, sec.name`,
-      [id]
+    const assignmentDocs = await CourseAssignment.find({ faculty_id: oid(id) })
+      .select('course_id section_id status')
+      .populate({ path: 'course_id', select: 'code name subject_id', populate: { path: 'subject_id', select: 'name' } })
+      .populate({ path: 'section_id', select: 'name class_id', populate: { path: 'class_id', select: 'name' } });
+
+    const assignments = assignmentDocs
+      .map((a) => ({
+        id: String(a._id),
+        course_code: a.course_id?.code ?? null,
+        course_name: a.course_id?.name ?? null,
+        subject_name: a.course_id?.subject_id?.name ?? null,
+        class_name: a.section_id?.class_id?.name ?? null,
+        section_name: a.section_id?.name ?? null,
+        status: a.status,
+      }))
+      .sort((a, b) => String(a.class_name ?? '').localeCompare(String(b.class_name ?? ''))
+        || String(a.section_name ?? '').localeCompare(String(b.section_name ?? '')));
+
+    const [attendanceRow] = await FacultyAttendance.aggregate([
+      { $match: { faculty_id: oid(id) } },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: 1 },
+          present: { $sum: { $cond: [{ $eq: ['$status', 'PRESENT'] }, 1, 0] } },
+          absent: { $sum: { $cond: [{ $eq: ['$status', 'ABSENT'] }, 1, 0] } },
+          leave_count: { $sum: { $cond: [{ $eq: ['$status', 'LEAVE'] }, 1, 0] } },
+        },
+      },
+    ]);
+    const attendance = attendanceRow || { total: 0, present: 0, absent: 0, leave_count: 0 };
+
+    const leaves = plain(
+      await LeaveRequest.find({ requester_type: 'FACULTY', faculty_id: oid(id) })
+        .sort({ created_at: -1 }).limit(20)
     );
 
-    const attendance = await get(
-      `SELECT COUNT(*) AS total,
-              SUM(CASE WHEN status = 'PRESENT' THEN 1 ELSE 0 END) AS present,
-              SUM(CASE WHEN status = 'ABSENT'  THEN 1 ELSE 0 END) AS absent,
-              SUM(CASE WHEN status = 'LEAVE'   THEN 1 ELSE 0 END) AS leave_count
-         FROM faculty_attendance WHERE faculty_id = ?`,
-      [id]
+    // `owner_id` is text, because a document may belong to any kind of record.
+    const documents = plain(
+      await Document.find({ owner_type: 'FACULTY', owner_id: String(id) }).sort({ created_at: -1 })
     );
 
-    const leaves = await all(
-      `SELECT * FROM leave_requests WHERE requester_type = 'FACULTY' AND faculty_id = ?
-        ORDER BY created_at DESC LIMIT 20`,
-      [id]
+    const mentees = lift(
+      await Student.find({ mentor_id: oid(id), status: 'ACTIVE' })
+        .select('admission_number first_name last_name class_id section_id')
+        .populate('class_id', 'name')
+        .populate('section_id', 'name'),
+      { class_id: { name: 'class_name' }, section_id: { name: 'section_name' } }
     );
 
-    const documents = await all(`SELECT * FROM documents WHERE owner_type = 'FACULTY' AND owner_id = ? ORDER BY created_at DESC`, [id]);
-
-    const mentees = await all(
-      `SELECT s.id, s.admission_number, s.first_name, s.last_name, c.name AS class_name, sec.name AS section_name
-         FROM students s
-         LEFT JOIN classes c ON c.id = s.class_id
-         LEFT JOIN sections sec ON sec.id = s.section_id
-        WHERE s.mentor_id = ? AND s.status = 'ACTIVE'`,
-      [id]
-    );
-
-    const timetable = await all(
-      `SELECT t.*, co.name AS course_name, c.name AS class_name, sec.name AS section_name
-         FROM timetables t
-         LEFT JOIN courses co ON co.id = t.course_id
-         LEFT JOIN sections sec ON sec.id = t.section_id
-         LEFT JOIN classes c ON c.id = t.class_id
-        WHERE t.faculty_id = ? ORDER BY t.day_of_week, t.period`,
-      [id]
+    const timetable = lift(
+      await Timetable.find({ faculty_id: oid(id) })
+        .populate('course_id', 'name')
+        .populate('section_id', 'name')
+        .populate('class_id', 'name')
+        .sort({ day_of_week: 1, period: 1 }),
+      {
+        course_id: { name: 'course_name' },
+        section_id: { name: 'section_name' },
+        class_id: { name: 'class_name' },
+      }
     );
 
     // Salary is visible to Admin, payroll-permitted staff, or the person themselves.
-    const isSelf = await facultyIdOf(req.user) === id;
+    const isSelf = sameId(await facultyIdOf(req.user), id);
     const canSeeSalary = isAdmin(req.user) || req.permissions.has('payroll.view') || isSelf;
     const salary = canSeeSalary
       ? {
-          structure: await get(`SELECT * FROM salary_structures WHERE user_id = ? AND status = 'ACTIVE' ORDER BY effective_from DESC LIMIT 1`, [
-            faculty.user_id,
-          ]),
-          recent: await all(`SELECT * FROM payroll WHERE user_id = ? ORDER BY year DESC, month DESC LIMIT 12`, [faculty.user_id]),
+          structure: plain(
+            await SalaryStructure.findOne({ user_id: oid(faculty.user_id), status: 'ACTIVE' })
+              .sort({ effective_from: -1 })
+          ),
+          recent: plain(
+            await Payroll.find({ user_id: oid(faculty.user_id) })
+              .sort({ year: -1, month: -1 }).limit(12)
+          ),
         }
       : null;
 
     const activity = isStaff(req.user)
-      ? await all(
-          `SELECT action, module, description, user_name, created_at FROM activity_logs
-            WHERE entity_type = 'Faculty' AND entity_id = ? ORDER BY created_at DESC LIMIT 20`,
-          [id]
-        )
+      ? plain(
+        await ActivityLog.find({ entity_type: 'Faculty', entity_id: String(id) })
+          .select('action module description user_name created_at')
+          .sort({ created_at: -1 }).limit(20)
+      )
       : [];
 
     return ok(res, { faculty, assignments, attendance, leaves, documents, mentees, timetable, salary, activity });
@@ -218,40 +283,43 @@ router.post(
     if (!campusId) throw badRequest('No campus is associated with your account');
 
     const roleCode = roleForStaffType(body.staff_type);
-    const role = await get('SELECT id FROM roles WHERE code = ?', [roleCode]);
+    const role = await Role.findOne({ code: roleCode }).select('_id').lean();
     if (!role) throw badRequest('Role configuration missing');
 
     const facultyCode = body.faculty_code || await nextFacultyCode(campusId, body.staff_type);
     const username = body.username || facultyCode.toLowerCase();
 
-    if (await get('SELECT 1 AS x FROM users WHERE lower(username) = lower(?)', [username])) throw conflict('That username is taken');
-    if (await get('SELECT 1 AS x FROM users WHERE lower(email) = lower(?)', [body.email])) throw conflict('That email is registered');
-    if (await get('SELECT 1 AS x FROM faculty WHERE faculty_code = ?', [facultyCode])) throw conflict('That faculty code exists');
+    if (await User.exists({ username: insensitive(username) })) throw conflict('That username is taken');
+    if (await User.exists({ email: insensitive(body.email) })) throw conflict('That email is registered');
+    if (await Faculty.exists({ faculty_code: facultyCode })) throw conflict('That faculty code exists');
 
     const password = body.password || env.seedPassword;
     const passwordHash = await hashPassword(password);
 
-    const result = await transaction(async () => {
-      const userId = await insert('users', {
+    const result = await transaction(async (session) => {
+      const opts = session ? { session } : {};
+      const [account] = await User.create([{
         username,
         email: body.email,
         password_hash: passwordHash,
         full_name: body.full_name,
         phone: body.phone,
         gender: body.gender,
-        role_id: role.id,
-        campus_id: campusId,
+        role_id: role?._id,
+        campus_id: oid(campusId),
         status: 'ACTIVE',
         must_change_password: body.password ? 0 : 1,
-        created_by: req.user.id,
-      });
-      const facultyId = await insert('faculty', {
+        created_by: oid(req.user.id),
+      }], opts);
+      const userId = account._id;
+
+      const [member] = await Faculty.create([{
         user_id: userId,
-        campus_id: campusId,
+        campus_id: oid(campusId),
         faculty_code: facultyCode,
         staff_type: body.staff_type,
         board: body.board || 'BOTH',
-        department_id: body.department_id,
+        department_id: oid(body.department_id),
         designation: body.designation,
         qualification: body.qualification,
         specialization: body.specialization,
@@ -265,9 +333,10 @@ router.post(
         pan_number: body.pan_number,
         is_mentor: body.is_mentor ? 1 : 0,
         status: body.status || 'ACTIVE',
-      });
-      return { userId, facultyId };
-    })();
+      }], opts);
+
+      return { userId: String(userId), facultyId: String(member._id) };
+    });
 
     await logActivity({
       req,
@@ -279,7 +348,7 @@ router.post(
       newValues: { faculty_code: facultyCode, staff_type: body.staff_type, role: roleCode },
     });
 
-    const row = await get(`SELECT ${SELECT_FACULTY} FROM faculty f ${JOIN_FACULTY} WHERE f.id = ?`, [result.facultyId]);
+    const row = await loadFacultyRow(result.facultyId);
     return created(res, { ...row, temporaryPassword: body.password ? undefined : password });
   })
 );
@@ -290,10 +359,10 @@ router.put(
   requirePermission('faculty.edit'),
   validateBody(facultySchema.partial()),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const existing = await get('SELECT * FROM faculty WHERE id = ?', [id]);
+    const id = req.params.id;
+    const existing = plain(await Faculty.findById(oid(id)));
     if (!existing) throw notFound('Faculty member not found');
-    if (!isAdmin(req.user) && existing.campus_id !== req.user.campus_id) throw forbidden('Different campus');
+    if (!isAdmin(req.user) && !sameId(existing.campus_id, req.user.campus_id)) throw forbidden('Different campus');
 
     const facultyFields = [
       'board', 'department_id', 'designation', 'qualification', 'specialization', 'experience_years',
@@ -306,9 +375,11 @@ router.put(
 
     // Changing category also changes the login role — they must stay in step.
     if (req.body.staff_type && req.body.staff_type !== existing.staff_type) {
-      const role = await get('SELECT id FROM roles WHERE code = ?', [roleForStaffType(req.body.staff_type)]);
+      const role = await Role.findOne({ code: roleForStaffType(req.body.staff_type) }).select('_id').lean();
       data.staff_type = req.body.staff_type;
-      await update('users', existing.user_id, { role_id: role.id });
+      // The login role follows the category — they must stay in step, or a
+      // teacher moved to finance keeps a teacher's permissions.
+      await User.updateOne({ _id: oid(existing.user_id) }, { $set: { role_id: role?._id } });
       await logActivity({
         req,
         action: 'ROLE_CHANGE',
@@ -321,11 +392,15 @@ router.put(
       });
     }
 
-    if (Object.keys(data).length) await update('faculty', id, data);
+    if (Object.keys(data).length) {
+      await Faculty.updateOne({ _id: oid(id) }, { $set: data }, { runValidators: true });
+    }
 
     const userData = {};
     for (const f of ['full_name', 'email', 'phone', 'gender']) if (req.body[f] !== undefined) userData[f] = req.body[f];
-    if (Object.keys(userData).length) await update('users', existing.user_id, userData);
+    if (Object.keys(userData).length) {
+      await User.updateOne({ _id: oid(existing.user_id) }, { $set: userData });
+    }
 
     const changes = diff(existing, { ...existing, ...data });
     await logActivity({
@@ -339,7 +414,7 @@ router.put(
       newValues: { ...changes.new, ...userData },
     });
 
-    return ok(res, await get(`SELECT ${SELECT_FACULTY} FROM faculty f ${JOIN_FACULTY} WHERE f.id = ?`, [id]));
+    return ok(res, await loadFacultyRow(id));
   })
 );
 
@@ -349,12 +424,12 @@ router.post(
   heavyLimiter,
   photoUpload.single('photo'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const faculty = await get('SELECT * FROM faculty WHERE id = ?', [id]);
+    const id = req.params.id;
+    const faculty = plain(await Faculty.findById(oid(id)));
     if (!faculty) throw notFound('Faculty member not found');
     if (!req.file) throw badRequest('No photo was uploaded');
     const path = await publicPath(req.file, 'photos');
-    await update('users', faculty.user_id, { photo: path });
+    await User.updateOne({ _id: oid(faculty.user_id) }, { $set: { photo: path } });
     await logActivity({ req, action: 'UPDATE', module: 'faculty', entityType: 'Faculty', entityId: id, description: 'Updated photo' });
     return ok(res, { id, photo: path });
   })
@@ -366,24 +441,25 @@ router.post(
   heavyLimiter,
   documentUpload.single('file'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const faculty = await get('SELECT * FROM faculty WHERE id = ?', [id]);
+    const id = req.params.id;
+    const faculty = plain(await Faculty.findById(oid(id)));
     if (!faculty) throw notFound('Faculty member not found');
     if (!req.file) throw badRequest('No file was uploaded');
 
-    const docId = await insert('documents', {
-      campus_id: faculty.campus_id,
+    const docId = String((await Document.create({
+      campus_id: oid(faculty.campus_id),
       owner_type: 'FACULTY',
-      owner_id: id,
+      // Text: a document may belong to a record in any collection.
+      owner_id: String(id),
       title: req.body.title || req.file.originalname,
       document_type: req.body.document_type || 'GENERAL',
       file_path: await publicPath(req.file, 'documents'),
       file_name: req.file.originalname,
       file_size: req.file.size,
       mime_type: req.file.mimetype,
-      uploaded_by: req.user.id,
-    });
-    return created(res, await get('SELECT * FROM documents WHERE id = ?', [docId]));
+      uploaded_by: oid(req.user.id),
+    }))._id);
+    return created(res, plain(await Document.findById(oid(docId))));
   })
 );
 
@@ -391,16 +467,21 @@ router.delete(
   '/:id',
   requirePermission('faculty.delete'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const faculty = await get('SELECT * FROM faculty WHERE id = ?', [id]);
+    const id = req.params.id;
+    const faculty = plain(await Faculty.findById(oid(id)));
     if (!faculty) throw notFound('Faculty member not found');
-    if (!isAdmin(req.user) && faculty.campus_id !== req.user.campus_id) throw forbidden('Different campus');
+    if (!isAdmin(req.user) && !sameId(faculty.campus_id, req.user.campus_id)) throw forbidden('Different campus');
 
-    const assigned = Number(await scalar(`SELECT COUNT(*) AS n FROM course_assignments WHERE faculty_id = ? AND status = 'ACTIVE'`, [id]));
+    // What the foreign key refused: removing someone who is still teaching.
+    const assigned = await CourseAssignment.countDocuments({ faculty_id: oid(id), status: 'ACTIVE' });
     if (assigned) throw badRequest(`Reassign ${assigned} active course assignment(s) before deleting this member`);
 
-    await run('DELETE FROM faculty WHERE id = ?', [id]);
-    await run('DELETE FROM users WHERE id = ?', [faculty.user_id]);
+    // The record and the account go together, or a sign-in survives the person.
+    await transaction(async (session) => {
+      const opts = session ? { session } : {};
+      await Faculty.deleteOne({ _id: oid(id) }, opts);
+      if (faculty.user_id) await User.deleteOne({ _id: oid(faculty.user_id) }, opts);
+    });
     await logActivity({
       req,
       action: 'DELETE',
