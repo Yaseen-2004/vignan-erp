@@ -13,7 +13,9 @@
  */
 import { Router } from 'express';
 import { z } from 'zod';
-import { all, get, run, scalar } from '../db/connection.js';
+import { PasswordResetRequest, User } from '../db/mongo/models.js';
+import { oid } from '../db/mongo/connection.js';
+import { escapeRegex, lift, populateFor } from '../db/mongo/query.js';
 import { hashPassword, revokeAllUserTokens } from '../lib/auth.js';
 import { logActivity } from '../lib/audit.js';
 import { badRequest, forbidden, notFound } from '../lib/errors.js';
@@ -34,16 +36,29 @@ const assertMayReset = (actor, target) => {
   }
 };
 
-const SELECT = `
-  SELECT r.id, r.user_id, r.submitted_login, r.contact, r.reason, r.status,
-         r.handled_at, r.handled_note, r.created_at,
-         u.username, u.full_name, u.email, u.phone, u.status AS account_status,
-         ro.code AS role_code, ro.name AS role_name,
-         h.full_name AS handled_by_name
-    FROM password_reset_requests r
-    JOIN users u  ON u.id = r.user_id
-    JOIN roles ro ON ro.id = u.role_id
-    LEFT JOIN users h ON h.id = r.handled_by`;
+/**
+ * What the three joins lifted onto each request: the account it is for, that
+ * account's role, and whoever dealt with it.
+ */
+const JOINED = {
+  user_id: {
+    username: 'username',
+    full_name: 'full_name',
+    email: 'email',
+    phone: 'phone',
+    status: 'account_status',
+  },
+  'user_id.role_id': { code: 'role_code', name: 'role_name' },
+  handled_by: { full_name: 'handled_by_name' },
+};
+
+/** One request, in the shape the joins produced. */
+const loadRequest = async (id) => {
+  const _id = oid(id);
+  if (!_id) return null;
+  const doc = await PasswordResetRequest.findById(_id).populate(populateFor(JOINED));
+  return doc ? lift(doc, JOINED) : null;
+};
 
 /** The queue, newest first, pending before anything already dealt with. */
 router.get(
@@ -51,30 +66,44 @@ router.get(
   requirePermission('password_resets.view'),
   asyncHandler(async (req, res) => {
     const { page, limit, offset } = pagination(req.query);
-    const filters = [];
-    const params = [];
+    const filter = {};
 
     if (req.query.status) {
-      filters.push('r.status = ?');
-      params.push(String(req.query.status).toUpperCase());
+      filter.status = String(req.query.status).toUpperCase();
     }
+    /*
+     * Searching matched the person's name as well as what they typed to sign
+     * in, and the name lives on the account rather than on the request. The
+     * matching accounts are found first and the queue narrowed to them, which
+     * is what the join allowed the WHERE to do.
+     */
     if (req.query.search) {
-      filters.push('(u.full_name ILIKE ? OR u.username ILIKE ? OR r.submitted_login ILIKE ?)');
-      const like = `%${req.query.search}%`;
-      params.push(like, like, like);
+      const term = new RegExp(escapeRegex(String(req.query.search)), 'i');
+      const users = await User.find({ $or: [{ full_name: term }, { username: term }] })
+        .select('_id').lean();
+      filter.$or = [
+        { submitted_login: term },
+        { user_id: { $in: users.map((u) => u._id) } },
+      ];
     }
-    const where = filters.length ? ` WHERE ${filters.join(' AND ')}` : '';
 
-    const total = await scalar(
-      `SELECT COUNT(*) FROM password_reset_requests r JOIN users u ON u.id = r.user_id${where}`,
-      params
-    );
-    const rows = await all(
-      `${SELECT}${where}
-        ORDER BY CASE r.status WHEN 'PENDING' THEN 0 ELSE 1 END, r.created_at DESC
-        LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
-    );
+    /*
+     * Pending first, then newest. The CASE was an ordering, not a value: it
+     * put anything still waiting above anything already dealt with. A sort on
+     * status alone would not — 'COMPLETED' sorts before 'PENDING' — so the
+     * rank is computed and sorted on.
+     */
+    const [docs, total] = await Promise.all([
+      PasswordResetRequest.aggregate([
+        { $match: filter },
+        { $addFields: { pending_first: { $cond: [{ $eq: ['$status', 'PENDING'] }, 0, 1] } } },
+        { $sort: { pending_first: 1, created_at: -1 } },
+        { $skip: offset },
+        { $limit: limit },
+      ]).then((raw) => PasswordResetRequest.populate(raw, populateFor(JOINED))),
+      PasswordResetRequest.countDocuments(filter),
+    ]);
+    const rows = lift(docs, JOINED);
 
     return paginated(res, rows, total, { page, limit });
   })
@@ -85,7 +114,7 @@ router.get(
   '/pending-count',
   requirePermission('password_resets.view'),
   asyncHandler(async (req, res) =>
-    ok(res, { pending: await scalar("SELECT COUNT(*) FROM password_reset_requests WHERE status = 'PENDING'") })
+    ok(res, { pending: await PasswordResetRequest.countDocuments({ status: 'PENDING' }) })
   )
 );
 
@@ -110,34 +139,36 @@ router.post(
     })
   ),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const request = await get(`${SELECT} WHERE r.id = ?`, [id]);
+    const id = req.params.id;
+    const request = await loadRequest(id);
     if (!request) throw notFound('Reset request not found');
     if (request.status !== 'PENDING') throw badRequest('This request has already been dealt with.');
 
-    const target = await get('SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?', [
-      request.user_id,
-    ]);
+    const targetDoc = await User.findById(oid(request.user_id)).populate('role_id', 'code');
+    const target = targetDoc ? lift(targetDoc, { role_id: { code: 'role_code' } }) : null;
     if (!target) throw notFound('The account no longer exists');
     assertMayReset(req.user, target);
 
     const password = req.body.password || `Vignan@${Math.floor(1000 + Math.random() * 9000)}`;
-    await run(
-      `UPDATE users
-          SET password_hash = ?, must_change_password = 1, failed_attempts = 0,
-              locked_until = NULL, updated_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS')
-        WHERE id = ?`,
-      [await hashPassword(password), target.id]
-    );
+    await User.updateOne({ _id: oid(target.id) }, {
+      $set: {
+        password_hash: await hashPassword(password),
+        must_change_password: 1,
+        failed_attempts: 0,
+        locked_until: null,
+      },
+    });
     // Any session opened with the old password is no longer trustworthy.
     await revokeAllUserTokens(target.id);
 
-    await run(
-      `UPDATE password_reset_requests
-          SET status = 'COMPLETED', handled_by = ?, handled_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS'), handled_note = ?
-        WHERE id = ?`,
-      [req.user.id, req.body.note?.trim() || null, id]
-    );
+    await PasswordResetRequest.updateOne({ _id: oid(id) }, {
+      $set: {
+        status: 'COMPLETED',
+        handled_by: oid(req.user.id),
+        handled_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+        handled_note: req.body.note?.trim() || null,
+      },
+    });
 
     await logActivity({
       req,
@@ -165,22 +196,23 @@ router.post(
   requirePermission('password_resets.manage'),
   validateBody(z.object({ note: z.string().max(500).optional() })),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const request = await get(`${SELECT} WHERE r.id = ?`, [id]);
+    const id = req.params.id;
+    const request = await loadRequest(id);
     if (!request) throw notFound('Reset request not found');
     if (request.status !== 'PENDING') throw badRequest('This request has already been dealt with.');
 
-    const target = await get('SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?', [
-      request.user_id,
-    ]);
+    const targetDoc = await User.findById(oid(request.user_id)).populate('role_id', 'code');
+    const target = targetDoc ? lift(targetDoc, { role_id: { code: 'role_code' } }) : null;
     if (target) assertMayReset(req.user, target);
 
-    await run(
-      `UPDATE password_reset_requests
-          SET status = 'REJECTED', handled_by = ?, handled_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS'), handled_note = ?
-        WHERE id = ?`,
-      [req.user.id, req.body.note?.trim() || null, id]
-    );
+    await PasswordResetRequest.updateOne({ _id: oid(id) }, {
+      $set: {
+        status: 'REJECTED',
+        handled_by: oid(req.user.id),
+        handled_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+        handled_note: req.body.note?.trim() || null,
+      },
+    });
 
     await logActivity({
       req,

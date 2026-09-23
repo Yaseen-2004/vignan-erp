@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { all, get, run, insert, update, scalar } from '../db/connection.js';
+import { ActivityLog, SystemSetting, byCollection } from '../db/mongo/models.js';
+import { oid } from '../db/mongo/connection.js';
+import { escapeRegex, lift, plain } from '../db/mongo/query.js';
 import { asyncHandler, ok, pagination, paginated } from '../lib/http.js';
 import { notFound, forbidden, badRequest } from '../lib/errors.js';
 import { requirePermission, requireRole } from '../middleware/auth.js';
@@ -27,40 +29,41 @@ router.get(
       clauses.push('(l.campus_id = ? OR l.campus_id IS NULL)');
       params.push(req.user.campus_id);
     }
-    for (const [field, column] of [
-      ['user_id', 'l.user_id'],
-      ['action', 'l.action'],
-      ['module', 'l.module'],
-      ['entity_type', 'l.entity_type'],
-      ['status', 'l.status'],
-      ['role_code', 'l.role_code'],
-    ]) {
-      if (req.query[field] && req.query[field] !== 'ALL') {
-        clauses.push(`${column} = ?`);
-        params.push(req.query[field]);
-      }
+    const filter = {};
+    for (const field of ['user_id', 'action', 'module', 'entity_type', 'status', 'role_code']) {
+      const value = req.query[field];
+      if (value && value !== 'ALL') filter[field] = field === 'user_id' ? oid(value) : value;
     }
-    if (req.query.from) {
-      clauses.push("substr(l.created_at, 1, 10) >= ?");
-      params.push(req.query.from);
-    }
-    if (req.query.to) {
-      clauses.push("substr(l.created_at, 1, 10) <= ?");
-      params.push(req.query.to);
-    }
-    if (req.query.search) {
-      clauses.push('(l.description ILIKE ? OR l.user_name ILIKE ? OR l.action ILIKE ?)');
-      const term = `%${req.query.search}%`;
-      params.push(term, term, term);
-    }
-    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
-    const total = Number(await scalar(`SELECT COUNT(*) AS n FROM activity_logs l ${where}`, params));
-    const rows = (await all(
-      `SELECT l.*, u.username FROM activity_logs l LEFT JOIN users u ON u.id = l.user_id
-       ${where} ORDER BY l.created_at DESC, l.id DESC LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
-    )).map((row) => ({
+    /*
+     * A date range over a timestamp stored as text.
+     *
+     * `substr(created_at, 1, 10) >= from` compared the day only. The same is
+     * true of a string comparison here because the format is fixed and sorts
+     * with the instants it denotes — and the upper bound carries \uffff so a
+     * request "to" a given day includes everything recorded during it, rather
+     * than stopping at midnight.
+     */
+    if (req.query.from) filter.created_at = { $gte: String(req.query.from) };
+    if (req.query.to) {
+      filter.created_at = { ...(filter.created_at || {}), $lte: `${String(req.query.to)}\uffff` };
+    }
+
+    if (req.query.search) {
+      const term = new RegExp(escapeRegex(String(req.query.search)), 'i');
+      filter.$or = [{ description: term }, { user_name: term }, { action: term }];
+    }
+
+    const [docs, total] = await Promise.all([
+      ActivityLog.find(filter)
+        .populate('user_id', 'username')
+        .sort({ created_at: -1, _id: -1 })
+        .skip(offset)
+        .limit(limit),
+      ActivityLog.countDocuments(filter),
+    ]);
+
+    const rows = lift(docs, { user_id: { username: 'username' } }).map((row) => ({
       ...row,
       old_values: row.old_values ? safeParse(row.old_values) : null,
       new_values: row.new_values ? safeParse(row.new_values) : null,
@@ -84,10 +87,10 @@ router.get(
   requirePermission('audit.view'),
   asyncHandler(async (_req, res) =>
     ok(res, {
-      actions: (await all('SELECT DISTINCT action FROM activity_logs ORDER BY action')).map((r) => r.action),
-      modules: (await all('SELECT DISTINCT module FROM activity_logs WHERE module IS NOT NULL ORDER BY module')).map((r) => r.module),
-      roles: (await all('SELECT DISTINCT role_code FROM activity_logs WHERE role_code IS NOT NULL ORDER BY role_code')).map(
-        (r) => r.role_code
+      actions: (await ActivityLog.distinct('action')).filter(Boolean).sort(),
+      modules: (await ActivityLog.distinct('module')).filter(Boolean).sort(),
+      roles: (await ActivityLog.distinct('role_code')).filter(Boolean).sort().map(
+        (r) => r
       ),
     })
   )
@@ -97,8 +100,10 @@ router.get(
   '/audit-logs/:id',
   requirePermission('audit.view'),
   asyncHandler(async (req, res) => {
-    const row = await get('SELECT * FROM activity_logs WHERE id = ?', [Number(req.params.id)]);
-    if (!row) throw notFound('Log entry not found');
+    const id = oid(req.params.id);
+    const doc = id ? await ActivityLog.findById(id) : null;
+    if (!doc) throw notFound('Log entry not found');
+    const row = plain(doc);
     return ok(res, {
       ...row,
       old_values: row.old_values ? safeParse(row.old_values) : null,
@@ -114,12 +119,12 @@ router.get(
   '/settings',
   requirePermission('settings.view'),
   asyncHandler(async (req, res) => {
-    const rows = await all(
-      `SELECT s.*, u.full_name AS updated_by_name FROM system_settings s
-         LEFT JOIN users u ON u.id = s.updated_by
-        WHERE s.campus_id = ? OR s.campus_id IS NULL
-        ORDER BY s.category, s.key`,
-      [req.user.campus_id]
+    // A campus's own settings and the ones that apply everywhere.
+    const rows = lift(
+      await SystemSetting.find({ $or: [{ campus_id: oid(req.user.campus_id) }, { campus_id: null }] })
+        .populate('updated_by', 'full_name')
+        .sort({ category: 1, key: 1 }),
+      { updated_by: { full_name: 'updated_by_name' } }
     );
     const grouped = {};
     for (const row of rows) {
@@ -153,31 +158,34 @@ router.put(
   asyncHandler(async (req, res) => {
     const changes = [];
     for (const setting of req.body.settings) {
-      const existing = await get('SELECT * FROM system_settings WHERE key = ? AND (campus_id = ? OR campus_id IS NULL)', [
-        setting.key,
-        req.user.campus_id,
-      ]);
+      const existingDoc = await SystemSetting.findOne({
+        key: setting.key,
+        $or: [{ campus_id: oid(req.user.campus_id) }, { campus_id: null }],
+      });
+      const existing = existingDoc ? plain(existingDoc) : null;
       if (existing) {
         if (String(existing.value ?? '') !== String(setting.value ?? '')) {
           changes.push({ key: setting.key, from: existing.value, to: setting.value });
         }
-        await update('system_settings', existing.id, {
-          value: setting.value,
-          label: setting.label ?? existing.label,
-          value_type: setting.value_type ?? existing.value_type,
-          is_public: setting.is_public ?? existing.is_public,
-          updated_by: req.user.id,
+        await SystemSetting.updateOne({ _id: existingDoc._id }, {
+          $set: {
+            value: setting.value,
+            label: setting.label ?? existing.label,
+            value_type: setting.value_type ?? existing.value_type,
+            is_public: setting.is_public ?? existing.is_public,
+            updated_by: oid(req.user.id),
+          },
         });
       } else {
-        await insert('system_settings', {
-          campus_id: req.user.campus_id,
+        await SystemSetting.create({
+          campus_id: oid(req.user.campus_id),
           category: setting.category || 'GENERAL',
           key: setting.key,
           value: setting.value,
           value_type: setting.value_type || 'STRING',
           label: setting.label || setting.key,
           is_public: setting.is_public ? 1 : 0,
-          updated_by: req.user.id,
+          updated_by: oid(req.user.id),
         });
         changes.push({ key: setting.key, from: null, to: setting.value });
       }
@@ -207,8 +215,13 @@ router.get(
       'users', 'students', 'parents', 'faculty', 'administrators', 'courses', 'attendance',
       'marks', 'results', 'fee_payments', 'activity_logs', 'notifications',
     ];
-    const counts = {};
-    for (const table of tables) counts[table] = Number(await scalar(`SELECT COUNT(*) AS n FROM ${table}`));
+    // Counted together rather than one after another: twelve round trips to
+    // draw one panel is twelve times the wait for no reason.
+    const counted = await Promise.all(tables.map(async (table) => {
+      const Model = byCollection[table];
+      return [table, Model ? await Model.estimatedDocumentCount() : 0];
+    }));
+    const counts = Object.fromEntries(counted);
 
     return ok(res, {
       status: 'healthy',
