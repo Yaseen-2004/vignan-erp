@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { all, get, run, insert, update, scalar } from '../db/connection.js';
+import { Class, Event, ExamSubject, Faculty, Message, Notification, Role, Student, User, byCollection } from '../db/mongo/models.js';
+import { oid } from '../db/mongo/connection.js';
+import { lift, plain, populateFor } from '../db/mongo/query.js';
+import { sameId } from '../lib/scope.js';
 import { asyncHandler, ok, created, pagination, paginated } from '../lib/http.js';
 import { badRequest, notFound, forbidden } from '../lib/errors.js';
 import { requirePermission } from '../middleware/auth.js';
@@ -28,38 +31,34 @@ const router = Router();
  * Staff who can publish see everything (including drafts); everyone else sees
  * published rows addressed to them, to their role, or to their class/section.
  */
-async function visibilityClause(req, alias, publishColumn = 'is_published') {
+async function visibilityFilter(req, publishColumn = 'is_published') {
   if (isAdmin(req.user) || req.permissions.has('announcements.publish') || req.permissions.has('notices.publish')) {
     return null;
   }
 
   const targets = ['ALL'];
-  const params = [];
-  let extra = '';
+  /*
+   * Anything addressed to this person's class or section as well as to their
+   * group. The SQL built these as extra OR branches; they are the same
+   * branches, collected.
+   */
+  const reaching = [];
 
   if (isStudent(req.user)) {
     targets.push('STUDENTS');
-    const student = await get('SELECT class_id, section_id FROM students WHERE user_id = ?', [req.user.id]);
+    const student = await Student.findOne({ user_id: oid(req.user.id) })
+      .select('class_id section_id').lean();
     if (student) {
-      extra = ` OR (${alias}.target_type = 'CLASS' AND ${alias}.target_class_id = ?)
-                OR (${alias}.target_type = 'SECTION' AND ${alias}.target_section_id = ?)`;
-      params.push(student.class_id, student.section_id);
+      if (student.class_id) reaching.push({ target_type: 'CLASS', target_class_id: student.class_id });
+      if (student.section_id) reaching.push({ target_type: 'SECTION', target_section_id: student.section_id });
     }
   } else if (isParent(req.user)) {
     targets.push('PARENTS');
     const children = await childrenOf(req.user);
-    if (children.length) {
-      const classIds = children.map((c) => c.class_id).filter(Boolean);
-      const sectionIds = children.map((c) => c.section_id).filter(Boolean);
-      if (classIds.length) {
-        extra += ` OR (${alias}.target_type = 'CLASS' AND ${alias}.target_class_id IN (${classIds.map(() => '?').join(',')}))`;
-        params.push(...classIds);
-      }
-      if (sectionIds.length) {
-        extra += ` OR (${alias}.target_type = 'SECTION' AND ${alias}.target_section_id IN (${sectionIds.map(() => '?').join(',')}))`;
-        params.push(...sectionIds);
-      }
-    }
+    const classIds = children.map((c) => oid(c.class_id)).filter(Boolean);
+    const sectionIds = children.map((c) => oid(c.section_id)).filter(Boolean);
+    if (classIds.length) reaching.push({ target_type: 'CLASS', target_class_id: { $in: classIds } });
+    if (sectionIds.length) reaching.push({ target_type: 'SECTION', target_section_id: { $in: sectionIds } });
   } else if (isTeacher(req.user)) {
     targets.push('FACULTY', 'TEACHING_STAFF');
   } else if (isFinancial(req.user)) {
@@ -68,30 +67,30 @@ async function visibilityClause(req, alias, publishColumn = 'is_published') {
     targets.push('ADMINISTRATORS');
   }
 
-  const clause = `${alias}.${publishColumn} = 1 AND ((${alias}.target_type IN (${targets
-    .map(() => '?')
-    .join(',')}))${extra})`;
-  return { clause, params: [...targets, ...params] };
+  // Published, and addressed to one of the groups this person belongs to.
+  return {
+    [publishColumn]: 1,
+    $or: [{ target_type: { $in: targets } }, ...reaching],
+  };
 }
 
 /** Shared factory for announcements / notices / circulars. */
 function broadcastRouter({ table, module, entityType, dateColumn, extraColumns = '' }) {
-  const alias = 'b';
   const resource = createResourceRouter({
     table,
     module,
     entityType,
-    alias,
-    select: `${alias}.*, u.full_name AS created_by_name, c.name AS target_class_name, sec.name AS target_section_name${extraColumns}`,
-    joins: `LEFT JOIN users u ON u.id = ${alias}.created_by
-            LEFT JOIN classes c ON c.id = ${alias}.target_class_id
-            LEFT JOIN sections sec ON sec.id = ${alias}.target_section_id`,
-    searchable: [`${alias}.title`, `${alias}.content`],
+    populate: {
+      created_by: { full_name: 'created_by_name' },
+      target_class_id: { name: 'target_class_name' },
+      target_section_id: { name: 'target_section_name' },
+    },
+    searchable: ['title', 'content'],
     filterable: ['target_type', 'is_published', 'target_class_id', 'target_section_id'],
     sortable: ['id', dateColumn, 'created_at'],
     required: ['title', 'content'],
     defaultSort: dateColumn,
-    scopeClause: async (req) => await visibilityClause(req, alias),
+    scopeFilter: (req) => visibilityFilter(req),
   });
 
   /** Publish and fan out notifications to the selected audience. */
@@ -99,13 +98,14 @@ function broadcastRouter({ table, module, entityType, dateColumn, extraColumns =
     `/:id/publish`,
     requirePermission(`${module}.publish`),
     asyncHandler(async (req, res) => {
-      const id = Number(req.params.id);
-      const row = await get(`SELECT * FROM ${table} WHERE id = ?`, [id]);
+      const id = req.params.id;
+      const Model = byCollection[table];
+      const row = plain(await Model.findById(oid(id)));
       if (!row) throw notFound(`${entityType} not found`);
-      if (!isAdmin(req.user) && row.campus_id !== req.user.campus_id) throw forbidden('Different campus');
+      if (!isAdmin(req.user) && !sameId(row.campus_id, req.user.campus_id)) throw forbidden('Different campus');
 
       const publish = req.body?.publish === false ? 0 : 1;
-      await update(table, id, { is_published: publish });
+      await Model.updateOne({ _id: oid(id) }, { $set: { is_published: publish } });
 
       let recipients = 0;
       if (publish) {
@@ -201,26 +201,47 @@ router.get(
     const campusId = req.user.campus_id;
 
     const publishedOnly = isStaff(req.user) ? '' : ' AND is_published = 1';
-    const events = await all(
-      `SELECT id, title, description, event_type, start_date, end_date, start_time, end_time, venue
-         FROM events
-        WHERE campus_id = ? AND substr(start_date, 1, 10) BETWEEN ? AND ?${publishedOnly}
-        ORDER BY start_date`,
-      [campusId, from, to]
+    // BETWEEN over dates stored as text: the format sorts with the days, and
+    // the upper bound carries a suffix so the last day is included whole.
+    const between = (field) => ({ [field]: { $gte: from, $lte: `${to}\uffff` } });
+
+    const events = plain(
+      await Event.find({
+        campus_id: oid(campusId),
+        ...between('start_date'),
+        ...(publishedOnly ? { is_published: 1 } : {}),
+      })
+        .select('title description event_type start_date end_date start_time end_time venue')
+        .sort({ start_date: 1 })
     );
 
-    const exams = await all(
-      `SELECT es.id, es.exam_date AS start_date, es.start_time, es.end_time, es.room,
-              e.name AS exam_name, sub.name AS subject_name, c.name AS class_name
-         FROM exam_subjects es
-         JOIN examinations e ON e.id = es.examination_id
-         JOIN courses co ON co.id = es.course_id
-         JOIN subjects sub ON sub.id = co.subject_id
-         LEFT JOIN classes c ON c.id = COALESCE(es.class_id, co.class_id)
-        WHERE es.campus_id = ? AND substr(es.exam_date, 1, 10) BETWEEN ? AND ?
-        ORDER BY es.exam_date`,
-      [campusId, from, to]
-    );
+    const examDocs = await ExamSubject.find({ campus_id: oid(campusId), ...between('exam_date') })
+      .select('exam_date start_time end_time room examination_id course_id class_id')
+      .populate('examination_id', 'name')
+      .populate({ path: 'course_id', select: 'subject_id class_id', populate: { path: 'subject_id', select: 'name' } })
+      .populate('class_id', 'name')
+      .sort({ exam_date: 1 });
+
+    // A class is taken from the paper when it names one, and otherwise from
+    // the course — which is what COALESCE(es.class_id, co.class_id) said.
+    const courseClassIds = examDocs
+      .filter((x) => !x.class_id && x.course_id?.class_id)
+      .map((x) => x.course_id.class_id);
+    const courseClasses = courseClassIds.length
+      ? await Class.find({ _id: { $in: courseClassIds } }).select('name').lean()
+      : [];
+    const classNameFor = new Map(courseClasses.map((c) => [String(c._id), c.name]));
+
+    const exams = examDocs.map((x) => ({
+      id: String(x._id),
+      start_date: x.exam_date,
+      start_time: x.start_time,
+      end_time: x.end_time,
+      room: x.room,
+      exam_name: x.examination_id?.name ?? null,
+      subject_name: x.course_id?.subject_id?.name ?? null,
+      class_name: x.class_id?.name ?? classNameFor.get(String(x.course_id?.class_id)) ?? null,
+    }));
 
     const feed = [
       ...events.map((e) => ({
@@ -256,30 +277,33 @@ router.get(
     const { page, limit, offset } = pagination(req.query, 20);
     const box = req.query.box === 'sent' ? 'sent' : 'inbox';
 
-    const where =
-      box === 'sent'
-        ? 'm.sender_id = ? AND m.sender_deleted = 0'
-        : 'm.recipient_id = ? AND m.recipient_deleted = 0';
-    const params = [req.user.id];
+    /*
+     * Deleting a message hides it from the person who deleted it, not from the
+     * other party — each side has its own flag, and which one applies depends
+     * on which box is open.
+     */
+    const filter = box === 'sent'
+      ? { sender_id: oid(req.user.id), sender_deleted: 0 }
+      : { recipient_id: oid(req.user.id), recipient_deleted: 0 };
+    if (req.query.unread === 'true' && box === 'inbox') filter.is_read = 0;
 
-    if (req.query.unread === 'true' && box === 'inbox') params.push();
+    const MAPPING = {
+      sender_id: { full_name: 'sender_name', photo: 'sender_photo' },
+      'sender_id.role_id': { code: 'sender_role' },
+      recipient_id: { full_name: 'recipient_name' },
+      'recipient_id.role_id': { code: 'recipient_role' },
+      context_student_id: { first_name: 'context_student_name' },
+    };
 
-    const filter = req.query.unread === 'true' && box === 'inbox' ? ' AND m.is_read = 0' : '';
-    const total = Number(await scalar(`SELECT COUNT(*) AS n FROM messages m WHERE ${where}${filter}`, params));
-    const rows = await all(
-      `SELECT m.*, su.full_name AS sender_name, su.photo AS sender_photo, sr.code AS sender_role,
-              ru.full_name AS recipient_name, rr.code AS recipient_role,
-              st.first_name AS context_student_name
-         FROM messages m
-         JOIN users su ON su.id = m.sender_id
-         JOIN roles sr ON sr.id = su.role_id
-         JOIN users ru ON ru.id = m.recipient_id
-         JOIN roles rr ON rr.id = ru.role_id
-         LEFT JOIN students st ON st.id = m.context_student_id
-        WHERE ${where}${filter}
-        ORDER BY m.created_at DESC LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
-    );
+    const [docs, total] = await Promise.all([
+      Message.find(filter)
+        .populate(populateFor(MAPPING))
+        .sort({ created_at: -1 })
+        .skip(offset)
+        .limit(limit),
+      Message.countDocuments(filter),
+    ]);
+    const rows = lift(docs, MAPPING);
     return paginated(res, rows, total, { page, limit });
   })
 );
@@ -294,26 +318,48 @@ router.get(
   requirePermission('messages.create'),
   asyncHandler(async (req, res) => {
     const campusId = req.user.campus_id;
-    let sql;
-    const params = [campusId];
+    const askingIsFamily = isStudent(req.user) || isParent(req.user);
 
-    if (isStudent(req.user) || isParent(req.user)) {
-      sql = `SELECT u.id, u.full_name, r.code AS role, f.designation, d.name AS department_name
-               FROM users u
-               JOIN roles r ON r.id = u.role_id
-               LEFT JOIN faculty f ON f.user_id = u.id
-               LEFT JOIN departments d ON d.id = f.department_id
-              WHERE u.campus_id = ? AND u.status = 'ACTIVE'
-                AND r.code IN ('TEACHING_STAFF','FINANCIAL_STAFF','ADMINISTRATOR','ADMIN')
-              ORDER BY r.level, u.full_name`;
+    const filter = { campus_id: oid(campusId), status: 'ACTIVE' };
+    if (askingIsFamily) {
+      // A family may only write to staff.
+      const roles = await Role.find({
+        code: { $in: ['TEACHING_STAFF', 'FINANCIAL_STAFF', 'ADMINISTRATOR', 'ADMIN'] },
+      }).select('_id').lean();
+      filter.role_id = { $in: roles.map((r) => r._id) };
     } else {
-      sql = `SELECT u.id, u.full_name, r.code AS role, NULL AS designation, NULL AS department_name
-               FROM users u JOIN roles r ON r.id = u.role_id
-              WHERE u.campus_id = ? AND u.status = 'ACTIVE' AND u.id != ?
-              ORDER BY r.level, u.full_name LIMIT 500`;
-      params.push(req.user.id);
+      filter._id = { $ne: oid(req.user.id) };
     }
-    return ok(res, await all(sql, params));
+
+    const docs = await User.find(filter)
+      .select('full_name role_id')
+      .populate('role_id', 'code level')
+      .limit(askingIsFamily ? 0 : 500);
+
+    // Staff carry a designation and a department; that is the only reason
+    // faculty was joined at all, so it is fetched only when it will be shown.
+    const staff = askingIsFamily
+      ? await Faculty.find({ user_id: { $in: docs.map((d) => d._id) } })
+        .select('user_id designation department_id')
+        .populate('department_id', 'name')
+      : [];
+    const staffFor = new Map(staff.map((f) => [String(f.user_id), f]));
+
+    const contacts = docs
+      .map((u) => ({
+        id: String(u._id),
+        full_name: u.full_name,
+        role: u.role_id?.code ?? null,
+        designation: staffFor.get(String(u._id))?.designation ?? null,
+        department_name: staffFor.get(String(u._id))?.department_id?.name ?? null,
+        _level: u.role_id?.level ?? 0,
+      }))
+      // Seniority first, then by name — as ORDER BY r.level, u.full_name did.
+      .sort((a, b) => a._level - b._level
+        || String(a.full_name ?? '').localeCompare(String(b.full_name ?? '')))
+      .map(({ _level, ...c }) => c);
+
+    return ok(res, contacts);
   })
 );
 
@@ -322,21 +368,19 @@ router.post(
   requirePermission('messages.create'),
   validateBody(
     z.object({
-      recipient_id: z.coerce.number().int().positive(),
+      recipient_id: z.string().min(1),
       subject: z.string().min(1, 'Enter a subject').max(160),
       body: z.string().min(1, 'Enter a message').max(4000),
-      context_student_id: z.coerce.number().int().positive().optional().nullable(),
-      parent_message_id: z.coerce.number().int().positive().optional().nullable(),
+      context_student_id: z.string().optional().nullable(),
+      parent_message_id: z.string().optional().nullable(),
     })
   ),
   asyncHandler(async (req, res) => {
-    const recipient = await get(
-      `SELECT u.*, r.code AS role_code FROM users u JOIN roles r ON r.id = u.role_id WHERE u.id = ?`,
-      [req.body.recipient_id]
-    );
+    const recipientDoc = await User.findById(oid(req.body.recipient_id)).populate('role_id', 'code');
+    const recipient = recipientDoc ? lift(recipientDoc, { role_id: { code: 'role_code' } }) : null;
     if (!recipient) throw notFound('Recipient not found');
     if (recipient.status !== 'ACTIVE') throw badRequest('That recipient is not active');
-    if (!isAdmin(req.user) && recipient.campus_id !== req.user.campus_id) {
+    if (!isAdmin(req.user) && !sameId(recipient.campus_id, req.user.campus_id)) {
       throw forbidden('You may only message people at your own campus');
     }
 
@@ -347,18 +391,18 @@ router.post(
     // A parent may only attach one of their own children as context.
     if (req.body.context_student_id && isParent(req.user)) {
       const children = (await childrenOf(req.user)).map((c) => c.id);
-      if (!children.includes(Number(req.body.context_student_id))) throw forbidden('That is not your child');
+      if (!children.some((c) => sameId(c, req.body.context_student_id))) throw forbidden('That is not your child');
     }
 
-    const id = await insert('messages', {
-      campus_id: req.user.campus_id,
-      sender_id: req.user.id,
-      recipient_id: recipient.id,
-      parent_message_id: req.body.parent_message_id,
+    const id = String((await Message.create({
+      campus_id: oid(req.user.campus_id),
+      sender_id: oid(req.user.id),
+      recipient_id: oid(recipient.id),
+      parent_message_id: oid(req.body.parent_message_id),
       subject: req.body.subject,
       body: req.body.body,
-      context_student_id: req.body.context_student_id,
-    });
+      context_student_id: oid(req.body.context_student_id),
+    }))._id);
 
     await notify({
       userId: recipient.id,
@@ -379,7 +423,7 @@ router.post(
       entityId: id,
       description: `Sent a message to ${recipient.full_name}`,
     });
-    return created(res, await get('SELECT * FROM messages WHERE id = ?', [id]));
+    return created(res, plain(await Message.findById(oid(id))));
   })
 );
 
@@ -387,11 +431,13 @@ router.patch(
   '/messages/:id/read',
   requirePermission('messages.view'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const message = await get('SELECT * FROM messages WHERE id = ?', [id]);
+    const id = req.params.id;
+    const message = plain(await Message.findById(oid(id)));
     if (!message) throw notFound('Message not found');
-    if (message.recipient_id !== req.user.id) throw forbidden('This message is not addressed to you');
-    await run("UPDATE messages SET is_read = 1, read_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?", [id]);
+    if (!sameId(message.recipient_id, req.user.id)) throw forbidden('This message is not addressed to you');
+    await Message.updateOne({ _id: oid(id) }, {
+      $set: { is_read: 1, read_at: new Date().toISOString().slice(0, 19).replace('T', ' ') },
+    });
     return ok(res, { id, is_read: 1 });
   })
 );
@@ -400,12 +446,17 @@ router.delete(
   '/messages/:id',
   requirePermission('messages.delete', 'messages.view'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const message = await get('SELECT * FROM messages WHERE id = ?', [id]);
+    const id = req.params.id;
+    const message = plain(await Message.findById(oid(id)));
     if (!message) throw notFound('Message not found');
-    if (message.recipient_id === req.user.id) await run('UPDATE messages SET recipient_deleted = 1 WHERE id = ?', [id]);
-    else if (message.sender_id === req.user.id) await run('UPDATE messages SET sender_deleted = 1 WHERE id = ?', [id]);
-    else throw forbidden('This message is not yours');
+    // Hidden from whoever deleted it; the other party still has their copy.
+    if (sameId(message.recipient_id, req.user.id)) {
+      await Message.updateOne({ _id: oid(id) }, { $set: { recipient_deleted: 1 } });
+    } else if (sameId(message.sender_id, req.user.id)) {
+      await Message.updateOne({ _id: oid(id) }, { $set: { sender_deleted: 1 } });
+    } else {
+      throw forbidden('This message is not yours');
+    }
     return ok(res, { id, deleted: true });
   })
 );
@@ -483,13 +534,15 @@ router.get(
   '/notifications',
   asyncHandler(async (req, res) => {
     const { page, limit, offset } = pagination(req.query, 20);
-    const unreadOnly = req.query.unread === 'true' ? ' AND is_read = 0' : '';
-    const total = Number(await scalar(`SELECT COUNT(*) AS n FROM notifications WHERE user_id = ?${unreadOnly}`, [req.user.id]));
-    const rows = await all(
-      `SELECT * FROM notifications WHERE user_id = ?${unreadOnly} ORDER BY created_at DESC LIMIT ? OFFSET ?`,
-      [req.user.id, limit, offset]
-    );
-    const unread = Number(await scalar('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND is_read = 0', [req.user.id]));
+    const mine = { user_id: oid(req.user.id) };
+    const filter = req.query.unread === 'true' ? { ...mine, is_read: 0 } : mine;
+
+    const [docs, total, unread] = await Promise.all([
+      Notification.find(filter).sort({ created_at: -1 }).skip(offset).limit(limit),
+      Notification.countDocuments(filter),
+      Notification.countDocuments({ ...mine, is_read: 0 }),
+    ]);
+    const rows = plain(docs);
     return res.json({ data: rows, meta: { page, limit, total, pages: Math.max(1, Math.ceil(total / limit)), unread } });
   })
 );
@@ -497,18 +550,20 @@ router.get(
 router.get(
   '/notifications/unread-count',
   asyncHandler(async (req, res) =>
-    ok(res, { unread: Number(await scalar('SELECT COUNT(*) AS n FROM notifications WHERE user_id = ? AND is_read = 0', [req.user.id])) })
+    ok(res, { unread: await Notification.countDocuments({ user_id: oid(req.user.id), is_read: 0 }) })
   )
 );
 
 router.patch(
   '/notifications/:id/read',
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const notification = await get('SELECT * FROM notifications WHERE id = ?', [id]);
+    const id = req.params.id;
+    const notification = plain(await Notification.findById(oid(id)));
     if (!notification) throw notFound('Notification not found');
-    if (notification.user_id !== req.user.id) throw forbidden('Not your notification');
-    await run("UPDATE notifications SET is_read = 1, read_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?", [id]);
+    if (!sameId(notification.user_id, req.user.id)) throw forbidden('Not your notification');
+    await Notification.updateOne({ _id: oid(id) }, {
+      $set: { is_read: 1, read_at: new Date().toISOString().slice(0, 19).replace('T', ' ') },
+    });
     return ok(res, { id, is_read: 1 });
   })
 );
@@ -516,9 +571,10 @@ router.patch(
 router.post(
   '/notifications/read-all',
   asyncHandler(async (req, res) => {
-    const changes = (await run("UPDATE notifications SET is_read = 1, read_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS') WHERE user_id = ? AND is_read = 0", [
-      req.user.id,
-    ])).changes;
+    const changes = (await Notification.updateMany(
+      { user_id: oid(req.user.id), is_read: 0 },
+      { $set: { is_read: 1, read_at: new Date().toISOString().slice(0, 19).replace('T', ' ') } }
+    )).modifiedCount;
     return ok(res, { updated: changes });
   })
 );
@@ -526,11 +582,11 @@ router.post(
 router.delete(
   '/notifications/:id',
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const notification = await get('SELECT * FROM notifications WHERE id = ?', [id]);
+    const id = req.params.id;
+    const notification = plain(await Notification.findById(oid(id)));
     if (!notification) throw notFound('Notification not found');
-    if (notification.user_id !== req.user.id) throw forbidden('Not your notification');
-    await run('DELETE FROM notifications WHERE id = ?', [id]);
+    if (!sameId(notification.user_id, req.user.id)) throw forbidden('Not your notification');
+    await Notification.deleteOne({ _id: oid(id) });
     return ok(res, { id, deleted: true });
   })
 );
