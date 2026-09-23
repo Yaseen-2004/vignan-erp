@@ -35,7 +35,7 @@ import importRoutes from './routes/imports.js';
 import passwordResetRoutes from './routes/passwordResets.js';
 import assignmentRoutes from './routes/assignments.js';
 import storageRoutes from './routes/storage.js';
-import { describe, isCloud as isCloudDatabase } from './db/connection.js';
+import { close as closeDatabase, connect as connectDatabase, describe } from './db/mongo/connection.js';
 import { Readable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { read as readUpload, describe as describeFiles, usingObjectStorage } from './lib/files.js';
@@ -75,7 +75,7 @@ app.get('/api/health', (_req, res) =>
   res.json({
     status: 'ok',
     app: env.appName,
-    database: isCloudDatabase ? 'cloud' : 'local',
+    database: 'mongodb',
     files: usingObjectStorage ? 'object-storage' : 'local-disk',
     time: new Date().toISOString(),
   })
@@ -167,6 +167,17 @@ app.use(errorHandler);
 const runDirectly = process.argv[1]
   && pathToFileURL(process.argv[1]).href === import.meta.url;
 
+/*
+ * The connection is opened before the first request rather than on it.
+ *
+ * Mongoose will queue operations against a connection that is still opening,
+ * so the server would appear to start and then answer slowly, or fail on the
+ * first query with a message about buffering rather than about the database.
+ * Connecting first means a bad MONGODB_URI stops the server here, where it
+ * says so.
+ */
+await connectDatabase();
+
 if (runDirectly) {
   const server = app.listen(env.port, () => {
     console.log(`\n  ${env.appName}`);
@@ -180,7 +191,9 @@ if (runDirectly) {
   for (const signal of ['SIGINT', 'SIGTERM']) {
     process.on(signal, () => {
       console.log(`\n${signal} received — shutting down.`);
-      server.close(() => process.exit(0));
+      // Close the database too, so a restart does not wait on connections
+      // the old process is still holding.
+      server.close(async () => { await closeDatabase(); process.exit(0); });
     });
   }
 

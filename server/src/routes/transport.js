@@ -1,5 +1,6 @@
 import { Router } from 'express';
-import { all, get, scalar } from '../db/connection.js';
+import { Driver, FuelRecord, Route, TransportAllocation, Vehicle, VehicleMaintenance } from '../db/mongo/models.js';
+import { lift, plain, startsWith } from '../db/mongo/query.js';
 import { asyncHandler, ok } from '../lib/http.js';
 import { requirePermission } from '../middleware/auth.js';
 import { createResourceRouter } from '../lib/crud.js';
@@ -163,51 +164,70 @@ router.get(
   requirePermission('transport.view'),
   asyncHandler(async (req, res) => {
     const campusId = req.user.campus_id;
-    const scope = isAdmin(req.user) && !campusId ? '' : ' WHERE campus_id = ?';
-    const p = scope ? [campusId] : [];
+    const scope = isAdmin(req.user) && !campusId ? {} : { campus_id: oid(campusId) };
 
-    const fleet = await get(
-      `SELECT COUNT(*) AS vehicles,
-              SUM(CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END) AS active,
-              SUM(CASE WHEN status = 'MAINTENANCE' THEN 1 ELSE 0 END) AS in_maintenance,
-              COALESCE(SUM(capacity), 0) AS total_capacity
-         FROM vehicles${scope}`,
-      p
-    );
-    const routes = Number(await scalar(`SELECT COUNT(*) AS n FROM routes${scope}`, p));
-    const drivers = Number(await scalar(`SELECT COUNT(*) AS n FROM drivers${scope}`, p));
-    const allocations = Number(
-      await scalar(`SELECT COUNT(*) AS n FROM transport_allocations${scope}${scope ? ' AND' : ' WHERE'} status = 'ACTIVE'`, p)
-    );
+    /** A CASE-counted total, as the fleet summary asked for. */
+    const [fleetRow] = await Vehicle.aggregate([
+      { $match: scope },
+      {
+        $group: {
+          _id: null,
+          vehicles: { $sum: 1 },
+          active: { $sum: { $cond: [{ $eq: ['$status', 'ACTIVE'] }, 1, 0] } },
+          in_maintenance: { $sum: { $cond: [{ $eq: ['$status', 'MAINTENANCE'] }, 1, 0] } },
+          total_capacity: { $sum: { $ifNull: ['$capacity', 0] } },
+        },
+      },
+    ]);
+    const fleet = fleetRow || { vehicles: 0, active: 0, in_maintenance: 0, total_capacity: 0 };
 
-    const fuelYtd = Number(
-      await scalar(
-        `SELECT COALESCE(SUM(total_cost), 0) AS n FROM fuel_records
-          WHERE substr(fuel_date, 1, 4) = to_char((now() AT TIME ZONE 'UTC'), 'YYYY')${scope ? ' AND campus_id = ?' : ''}`,
-        p
-      )
-    );
-    const maintenanceYtd = Number(
-      await scalar(
-        `SELECT COALESCE(SUM(cost), 0) AS n FROM vehicle_maintenance
-          WHERE substr(service_date, 1, 4) = to_char((now() AT TIME ZONE 'UTC'), 'YYYY')${scope ? ' AND campus_id = ?' : ''}`,
-        p
-      )
-    );
+    const [routes, drivers, allocations] = await Promise.all([
+      Route.countDocuments(scope),
+      Driver.countDocuments(scope),
+      TransportAllocation.countDocuments({ ...scope, status: 'ACTIVE' }),
+    ]);
 
-    const routeOccupancy = await all(
-      `SELECT r.id, r.name, r.route_code, r.fare, v.vehicle_number, v.capacity,
-              (SELECT COUNT(*) FROM transport_allocations ta WHERE ta.route_id = r.id AND ta.status = 'ACTIVE') AS allocated
-         FROM routes r LEFT JOIN vehicles v ON v.id = r.vehicle_id${scope ? ' WHERE r.campus_id = ?' : ''}
-        ORDER BY r.name`,
-      p
-    );
+    // Costs for this calendar year. The dates are text, so the year is matched
+    // on the first four characters exactly as the SQL did.
+    const year = new Date().toISOString().slice(0, 4);
+    const sumThisYear = async (Model, dateField, valueField) => {
+      const [row] = await Model.aggregate([
+        { $match: { ...scope, [dateField]: startsWith(year) } },
+        { $group: { _id: null, n: { $sum: { $ifNull: [`$${valueField}`, 0] } } } },
+      ]);
+      return row?.n ?? 0;
+    };
+    const fuelYtd = await sumThisYear(FuelRecord, 'fuel_date', 'total_cost');
+    const maintenanceYtd = await sumThisYear(VehicleMaintenance, 'service_date', 'cost');
 
-    const expiring = await all(
-      `SELECT vehicle_number, insurance_expiry, fitness_expiry FROM vehicles
-        WHERE (substr(insurance_expiry, 1, 10) <= to_char((now() AT TIME ZONE 'UTC') + interval '+60 days', 'YYYY-MM-DD') OR substr(fitness_expiry, 1, 10) <= to_char((now() AT TIME ZONE 'UTC') + interval '+60 days', 'YYYY-MM-DD'))
-        ${scope ? ' AND campus_id = ?' : ''}`,
-      p
+    // How full each route is. The allocated count was a correlated subquery;
+    // it is one grouped query here rather than one per route.
+    const routeDocs = await Route.find(scope)
+      .select('name route_code fare vehicle_id')
+      .populate('vehicle_id', 'vehicle_number capacity')
+      .sort({ name: 1 });
+    const allocated = await TransportAllocation.aggregate([
+      { $match: { ...scope, status: 'ACTIVE' } },
+      { $group: { _id: '$route_id', n: { $sum: 1 } } },
+    ]);
+    const allocatedByRoute = new Map(allocated.map((a) => [String(a._id), a.n]));
+    const routeOccupancy = lift(routeDocs, {
+      vehicle_id: { vehicle_number: 'vehicle_number', capacity: 'capacity' },
+    }).map((r) => ({ ...r, allocated: allocatedByRoute.get(r.id) ?? 0 }));
+
+    /*
+     * Papers falling due within sixty days.
+     *
+     * Compared as text, which works because the dates are stored as ISO days
+     * and sort the same way — the comparison the SQL made with substr(). A
+     * vehicle with neither date recorded is not due for anything, so a null
+     * must not match, which `$lte` on a missing field would otherwise do.
+     */
+    const horizon = new Date(Date.now() + 60 * 86400000).toISOString().slice(0, 10);
+    const dueBy = (field) => ({ [field]: { $ne: null, $lte: `${horizon}\uffff` } });
+    const expiring = plain(
+      await Vehicle.find({ ...scope, $or: [dueBy('insurance_expiry'), dueBy('fitness_expiry')] })
+        .select('vehicle_number insurance_expiry fitness_expiry')
     );
 
     return ok(res, {

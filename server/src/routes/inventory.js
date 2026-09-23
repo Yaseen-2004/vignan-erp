@@ -1,5 +1,7 @@
 import { Router } from 'express';
-import { all, get, scalar } from '../db/connection.js';
+import { Asset, InventoryCategory, InventoryItem, Purchase } from '../db/mongo/models.js';
+import { oid } from '../db/mongo/connection.js';
+import { lift, startsWith } from '../db/mongo/query.js';
 import { asyncHandler, ok } from '../lib/http.js';
 import { requirePermission } from '../middleware/auth.js';
 import { createResourceRouter } from '../lib/crud.js';
@@ -89,40 +91,80 @@ router.get(
   '/summary',
   requirePermission('inventory.view'),
   asyncHandler(async (req, res) => {
+    // An Admin with no campus of their own sees the whole institution;
+    // everyone else is confined to theirs.
     const campusId = req.user.campus_id;
-    const scope = isAdmin(req.user) && !campusId ? '' : ' WHERE campus_id = ?';
-    const p = scope ? [campusId] : [];
+    const scope = isAdmin(req.user) && !campusId ? {} : { campus_id: oid(campusId) };
 
-    const items = await get(
-      `SELECT COUNT(*) AS count, COALESCE(SUM(quantity), 0) AS units,
-              COALESCE(SUM(quantity * unit_cost), 0) AS value FROM inventory_items${scope}`,
-      p
+    /** COUNT / SUM over one collection, with COALESCE's zero for no rows. */
+    const totals = async (Model, fields) => {
+      const group = { _id: null, count: { $sum: 1 } };
+      for (const [name, expr] of Object.entries(fields)) group[name] = { $sum: expr };
+      const [row] = await Model.aggregate([{ $match: scope }, { $group: group }]);
+      const out = { count: row?.count ?? 0 };
+      for (const name of Object.keys(fields)) out[name] = row?.[name] ?? 0;
+      return out;
+    };
+
+    const items = await totals(InventoryItem, {
+      units: { $ifNull: ['$quantity', 0] },
+      value: { $multiply: [{ $ifNull: ['$quantity', 0] }, { $ifNull: ['$unit_cost', 0] }] },
+    });
+
+    const assets = await totals(Asset, { value: { $ifNull: ['$current_value', 0] } });
+
+    /*
+     * Stock at or below its reorder level. The comparison is between two
+     * fields of the same document, which a plain filter cannot express — that
+     * is what $expr is for.
+     */
+    const lowStock = lift(
+      await InventoryItem.find({
+        ...scope,
+        $expr: { $lte: [{ $ifNull: ['$quantity', 0] }, { $ifNull: ['$reorder_level', 0] }] },
+      })
+        .select('name item_code quantity reorder_level category_id')
+        .populate('category_id', 'name')
+        .sort({ quantity: 1 })
+        .limit(20),
+      { category_id: { name: 'category_name' } }
     );
-    const assets = await get(
-      `SELECT COUNT(*) AS count, COALESCE(SUM(current_value), 0) AS value FROM assets${scope}`,
-      p
-    );
-    const lowStock = await all(
-      `SELECT i.id, i.name, i.item_code, i.quantity, i.reorder_level, ic.name AS category_name
-         FROM inventory_items i JOIN inventory_categories ic ON ic.id = i.category_id
-        WHERE i.quantity <= i.reorder_level${scope ? ' AND i.campus_id = ?' : ''}
-        ORDER BY i.quantity LIMIT 20`,
-      p
-    );
-    const byCategory = await all(
-      `SELECT ic.name AS category, COUNT(i.id) AS items, COALESCE(SUM(i.quantity * i.unit_cost), 0) AS value
-         FROM inventory_categories ic LEFT JOIN inventory_items i ON i.category_id = ic.id
-        ${scope ? 'WHERE ic.campus_id = ?' : ''}
-        GROUP BY ic.id ORDER BY value DESC`,
-      p
-    );
-    const purchasesYtd = Number(
-      await scalar(
-        `SELECT COALESCE(SUM(total_cost), 0) AS n FROM purchases
-          WHERE substr(purchase_date, 1, 4) = to_char((now() AT TIME ZONE 'UTC'), 'YYYY')${scope ? ' AND campus_id = ?' : ''}`,
-        p
-      )
-    );
+
+    /*
+     * Value by category, including the categories holding nothing.
+     *
+     * That is what the LEFT JOIN was for: a category with no stock still
+     * appears, at zero. Grouping the items alone would silently drop it, and
+     * an empty category is exactly what somebody reading this wants to see.
+     */
+    const categories = await InventoryCategory.find(scope).select('name').lean();
+    const grouped = await InventoryItem.aggregate([
+      { $match: scope },
+      {
+        $group: {
+          _id: '$category_id',
+          items: { $sum: 1 },
+          value: { $sum: { $multiply: [{ $ifNull: ['$quantity', 0] }, { $ifNull: ['$unit_cost', 0] }] } },
+        },
+      },
+    ]);
+    const byCategoryId = new Map(grouped.map((g) => [String(g._id), g]));
+    const byCategory = categories
+      .map((c) => ({
+        category: c.name,
+        items: byCategoryId.get(String(c._id))?.items ?? 0,
+        value: byCategoryId.get(String(c._id))?.value ?? 0,
+      }))
+      .sort((a, b) => b.value - a.value);
+
+    // Purchases this calendar year — the dates are stored as text, so the year
+    // is matched on its first four characters, as the SQL did.
+    const year = new Date().toISOString().slice(0, 4);
+    const [purchases] = await Purchase.aggregate([
+      { $match: { ...scope, purchase_date: startsWith(year) } },
+      { $group: { _id: null, n: { $sum: { $ifNull: ['$total_cost', 0] } } } },
+    ]);
+    const purchasesYtd = purchases?.n ?? 0;
 
     return ok(res, { items, assets, lowStock, byCategory, purchasesYtd });
   })

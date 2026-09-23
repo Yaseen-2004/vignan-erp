@@ -1,7 +1,9 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import env from '../config/env.js';
-import { get, run } from '../db/connection.js';
+import { PasswordResetRequest, User } from '../db/mongo/models.js';
+import { oid } from '../db/mongo/connection.js';
+import { plain } from '../db/mongo/query.js';
 import { asyncHandler, ok } from '../lib/http.js';
 import { unauthorized, badRequest, forbidden } from '../lib/errors.js';
 import {
@@ -91,7 +93,7 @@ router.post(
       throw invalid();
     }
 
-    if (user.locked_until && new Date(user.locked_until + 'Z') > new Date()) {
+    if (user.locked_until && new Date(`${user.locked_until}Z`) > new Date()) {
       throw forbidden('Account temporarily locked after repeated failed attempts. Try again later.');
     }
 
@@ -99,9 +101,19 @@ router.post(
     if (!valid) {
       const attempts = user.failed_attempts + 1;
       const lock = attempts >= env.maxLoginAttempts;
-      await run(
-        `UPDATE users SET failed_attempts = ?, locked_until = ${lock ? `to_char((now() AT TIME ZONE 'UTC') + (${env.lockoutMinutes} || ' minutes')::interval, 'YYYY-MM-DD HH24:MI:SS')` : 'NULL'} WHERE id = ?`,
-        [attempts, user.id]
+      /*
+       * The lock time was computed by the database; it is computed here now.
+       * Written in the same format the rest of the column holds, because the
+       * check that reads it compares text — a value written any other way
+       * would compare wrongly and silently, and the wrong direction is an
+       * account that never unlocks.
+       */
+      const until = lock
+        ? new Date(Date.now() + env.lockoutMinutes * 60_000).toISOString().slice(0, 19).replace('T', ' ')
+        : null;
+      await User.updateOne(
+        { _id: oid(user.id) },
+        { $set: { failed_attempts: attempts, locked_until: until } }
       );
       await logActivity({
         req,
@@ -139,9 +151,13 @@ router.post(
       );
     }
 
-    await run("UPDATE users SET failed_attempts = 0, locked_until = NULL, last_login_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?", [
-      user.id,
-    ]);
+    await User.updateOne({ _id: oid(user.id) }, {
+      $set: {
+        failed_attempts: 0,
+        locked_until: null,
+        last_login_at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+      },
+    });
 
     const fresh = await loadUser(user.id);
     const accessToken = signAccessToken(fresh);
@@ -242,7 +258,8 @@ router.post(
     })
   ),
   asyncHandler(async (req, res) => {
-    const user = await get('SELECT * FROM users WHERE id = ?', [req.user.id]);
+    const user = plain(await User.findById(oid(req.user.id)));
+    if (!user) throw badRequest('Your account could not be found');
     const valid = await verifyPassword(req.body.currentPassword, user.password_hash);
     if (!valid) throw badRequest('Your current password is incorrect');
     if (req.body.currentPassword === req.body.newPassword) {
@@ -250,10 +267,10 @@ router.post(
     }
 
     const hash = await hashPassword(req.body.newPassword);
-    await run("UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD HH24:MI:SS') WHERE id = ?", [
-      hash,
-      user.id,
-    ]);
+    await User.updateOne(
+      { _id: oid(user.id) },
+      { $set: { password_hash: hash, must_change_password: 0 } }
+    );
     await revokeAllUserTokens(user.id);
 
     await logActivity({
@@ -310,27 +327,30 @@ router.post(
     }
 
     // One open request per account: asking twice should not queue twice.
-    const pending = await get(
-      "SELECT id FROM password_reset_requests WHERE user_id = ? AND status = 'PENDING'",
-      [user.id]
-    );
+    const pending = await PasswordResetRequest.findOne({ user_id: oid(user.id), status: 'PENDING' });
     if (pending) {
-      await run('UPDATE password_reset_requests SET contact = COALESCE(?, contact), reason = COALESCE(?, reason) WHERE id = ?', [
-        req.body.contact?.trim() || null,
-        req.body.reason?.trim() || null,
-        pending.id,
-      ]);
+      /*
+       * COALESCE kept whatever was already recorded when the new request said
+       * nothing, so asking again without a contact does not erase the one
+       * given the first time. Only the fields actually supplied are set.
+       */
+      const update = {};
+      if (req.body.contact?.trim()) update.contact = req.body.contact.trim();
+      if (req.body.reason?.trim()) update.reason = req.body.reason.trim();
+      if (Object.keys(update).length) {
+        await PasswordResetRequest.updateOne({ _id: pending._id }, { $set: update });
+      }
       return ok(res, generic);
     }
 
-    const result = await run(
-      // RETURNING id is how the new row's id comes back — Postgres has no
-      // equivalent of SQLite's implicit last-insert-rowid.
-      `INSERT INTO password_reset_requests (user_id, submitted_login, contact, reason, ip_address)
-       VALUES (?, ?, ?, ?, ?)
-       RETURNING id`,
-      [user.id, login, req.body.contact?.trim() || null, req.body.reason?.trim() || null, req.ip || null]
-    );
+    const created = await PasswordResetRequest.create({
+      user_id: oid(user.id),
+      submitted_login: login,
+      contact: req.body.contact?.trim() || null,
+      reason: req.body.reason?.trim() || null,
+      ip_address: req.ip || null,
+    });
+    const result = { id: String(created._id) };
 
     await logActivity({
       req,
