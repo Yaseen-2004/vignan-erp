@@ -1,6 +1,8 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { all, get, run, insert, update, scalar, transaction } from '../db/connection.js';
+import { Permission, Role, RolePermission, User } from '../db/mongo/models.js';
+import { oid, transaction } from '../db/mongo/connection.js';
+import { plain } from '../db/mongo/query.js';
 import { asyncHandler, ok, created } from '../lib/http.js';
 import { badRequest, notFound, forbidden } from '../lib/errors.js';
 import { requirePermission, requireRole } from '../middleware/auth.js';
@@ -15,7 +17,9 @@ router.get(
   '/permissions',
   requirePermission('roles.view'),
   asyncHandler(async (_req, res) => {
-    const rows = await all('SELECT id, code, module, action, description FROM permissions ORDER BY module, action');
+    const rows = plain(
+      await Permission.find({}).select('code module action description').sort({ module: 1, action: 1 })
+    );
     const grouped = {};
     for (const row of rows) {
       const label = MODULES[row.module]?.label || row.module;
@@ -30,12 +34,22 @@ router.get(
   '/',
   requirePermission('roles.view'),
   asyncHandler(async (_req, res) => {
-    const roles = await all(
-      `SELECT r.*,
-              (SELECT COUNT(*) FROM role_permissions rp WHERE rp.role_id = r.id) AS permission_count,
-              (SELECT COUNT(*) FROM users u WHERE u.role_id = r.id) AS user_count
-         FROM roles r ORDER BY r.level, r.name`
-    );
+    const roles = plain(await Role.find({}).sort({ level: 1, name: 1 }));
+
+    // The two counts were correlated subqueries — one grouped query each here,
+    // rather than two per role.
+    const countBy = async (Model, field) => {
+      const rows = await Model.aggregate([{ $group: { _id: `$${field}`, n: { $sum: 1 } } }]);
+      return new Map(rows.map((r) => [String(r._id), r.n]));
+    };
+    const [perms, users] = await Promise.all([
+      countBy(RolePermission, 'role_id'),
+      countBy(User, 'role_id'),
+    ]);
+    for (const role of roles) {
+      role.permission_count = perms.get(role.id) ?? 0;
+      role.user_count = users.get(role.id) ?? 0;
+    }
     return ok(res, roles);
   })
 );
@@ -44,15 +58,19 @@ router.get(
   '/:id',
   requirePermission('roles.view'),
   asyncHandler(async (req, res) => {
-    const role = await get('SELECT * FROM roles WHERE id = ?', [Number(req.params.id)]);
-    if (!role) throw notFound('Role not found');
-    const permissions = await all(
-      `SELECT p.id, p.code, p.module, p.action FROM role_permissions rp
-         JOIN permissions p ON p.id = rp.permission_id
-        WHERE rp.role_id = ? ORDER BY p.module, p.action`,
-      [role.id]
-    );
-    const users = Number(await scalar('SELECT COUNT(*) AS n FROM users WHERE role_id = ?', [role.id]));
+    const roleDoc = await Role.findById(oid(req.params.id));
+    if (!roleDoc) throw notFound('Role not found');
+    const role = plain(roleDoc);
+
+    const granted = await RolePermission.find({ role_id: roleDoc._id })
+      .populate('permission_id', 'code module action');
+    const permissions = granted
+      .map((rp) => rp.permission_id)
+      .filter(Boolean)
+      .map((p2) => plain(p2))
+      .sort((a, b) => a.module.localeCompare(b.module) || a.action.localeCompare(b.action));
+
+    const users = await User.countDocuments({ role_id: roleDoc._id });
     return ok(res, { ...role, permissions, user_count: users });
   })
 );
@@ -70,8 +88,8 @@ router.post(
     })
   ),
   asyncHandler(async (req, res) => {
-    if (await get('SELECT 1 AS x FROM roles WHERE code = ?', [req.body.code])) throw badRequest('That role code already exists');
-    const id = await insert('roles', { ...req.body, is_system: 0 });
+    if (await Role.exists({ code: req.body.code })) throw badRequest('That role code already exists');
+    const id = String((await Role.create({ ...req.body, is_system: 0 }))._id);
     await logActivity({
       req,
       action: 'CREATE',
@@ -81,7 +99,7 @@ router.post(
       description: `Created role ${req.body.code}`,
       newValues: req.body,
     });
-    return created(res, await get('SELECT * FROM roles WHERE id = ?', [id]));
+    return created(res, plain(await Role.findById(oid(id))));
   })
 );
 
@@ -97,10 +115,10 @@ router.put(
     })
   ),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const role = await get('SELECT * FROM roles WHERE id = ?', [id]);
+    const id = req.params.id;
+    const role = plain(await Role.findById(oid(id)));
     if (!role) throw notFound('Role not found');
-    await update('roles', id, req.body);
+    await Role.updateOne({ _id: oid(id) }, { $set: req.body }, { runValidators: true });
     await logActivity({
       req,
       action: 'ROLE_CHANGE',
@@ -111,7 +129,7 @@ router.put(
       oldValues: { name: role.name, description: role.description, level: role.level },
       newValues: req.body,
     });
-    return ok(res, await get('SELECT * FROM roles WHERE id = ?', [id]));
+    return ok(res, plain(await Role.findById(oid(id))));
   })
 );
 
@@ -122,28 +140,36 @@ router.put(
   requirePermission('roles.manage'),
   validateBody(z.object({ codes: z.array(z.string()).default([]) })),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const role = await get('SELECT * FROM roles WHERE id = ?', [id]);
+    const id = req.params.id;
+    const role = plain(await Role.findById(oid(id)));
     if (!role) throw notFound('Role not found');
     if (role.code === ROLES.ADMIN) {
       throw forbidden('The Admin role must retain complete access and cannot be restricted');
     }
 
-    const before = (await all(
-      `SELECT p.code FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id WHERE rp.role_id = ?`,
-      [id]
-    )).map((r) => r.code);
+    const before = (await RolePermission.find({ role_id: oid(id) }).populate('permission_id', 'code'))
+      .map((rp) => rp.permission_id?.code)
+      .filter(Boolean);
 
-    const apply = transaction(async () => {
-      await run('DELETE FROM role_permissions WHERE role_id = ?', [id]);
-      for (const code of req.body.codes) {
-        const permission = await get('SELECT id FROM permissions WHERE code = ?', [code]);
-        if (permission) {
-          await run('INSERT INTO role_permissions (role_id, permission_id) VALUES (?, ?) ON CONFLICT DO NOTHING', [id, permission.id]);
-        }
+    /*
+     * Replaced as one unit. Between the removal and the additions a role has
+     * no permissions at all, and a request arriving in that moment would be
+     * refused everything — which is why this is a transaction and not two
+     * independent writes.
+     */
+    await transaction(async (session) => {
+      const opts = session ? { session } : {};
+      await RolePermission.deleteMany({ role_id: oid(id) }, opts);
+
+      // The codes are resolved in one query rather than one apiece.
+      const wanted = await Permission.find({ code: { $in: req.body.codes } }).select('_id').lean();
+      if (wanted.length) {
+        await RolePermission.insertMany(
+          wanted.map((p2) => ({ role_id: oid(id), permission_id: p2._id })),
+          { ...opts, ordered: false }
+        );
       }
     });
-    await apply();
 
     await logActivity({
       req,
@@ -165,14 +191,15 @@ router.delete(
   requireRole(ROLES.ADMIN),
   requirePermission('roles.delete'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const role = await get('SELECT * FROM roles WHERE id = ?', [id]);
+    const id = req.params.id;
+    const role = plain(await Role.findById(oid(id)));
     if (!role) throw notFound('Role not found');
     if (role.is_system) throw badRequest('System roles cannot be deleted');
-    const users = Number(await scalar('SELECT COUNT(*) AS n FROM users WHERE role_id = ?', [id]));
+    // What the foreign key used to refuse: a role still in use.
+    const users = await User.countDocuments({ role_id: oid(id) });
     if (users) throw badRequest(`${users} user(s) still use this role`);
 
-    await run('DELETE FROM roles WHERE id = ?', [id]);
+    await Role.deleteOne({ _id: oid(id) });
     await logActivity({
       req,
       action: 'DELETE',

@@ -16,7 +16,10 @@ import fs from 'node:fs';
 import { Router } from 'express';
 import { z } from 'zod';
 import env from '../config/env.js';
-import { all, exec, get, run, scalar } from '../db/connection.js';
+import mongoose from 'mongoose';
+import { AcademicYear, CourseAssignment, Enrollment, ExamSubject, Examination, Mark, Notification, PushSubscription, RefreshToken, Result, SystemSetting, Timetable, byCollection } from '../db/mongo/models.js';
+import { oid } from '../db/mongo/connection.js';
+import { plain } from '../db/mongo/query.js';
 import { logActivity } from '../lib/audit.js';
 import { badRequest, notFound } from '../lib/errors.js';
 import { asyncHandler, ok } from '../lib/http.js';
@@ -51,34 +54,30 @@ const TRACKED = [
   ['users', 'User accounts'],
 ];
 
-const tableExists = async (name) =>
-  !!(await get(
-    `SELECT 1 AS x FROM information_schema.tables
-      WHERE table_schema = 'public' AND table_name = ?`,
-    [name]
-  ));
+/** A collection this build knows about. The models are the catalogue. */
+const modelFor = (name) => byCollection[name] || null;
 
-const rowsIn = async (table) => (await tableExists(table) ? Number(await scalar(`SELECT COUNT(*) FROM ${table}`) || 0) : 0);
+const rowsIn = async (table) => {
+  const Model = modelFor(table);
+  return Model ? Model.countDocuments({}) : 0;
+};
 
 /**
  * How much the database actually holds.
  *
- * `pg_database_size` is what the cloud provider bills against and what their
- * console shows, so the figure here matches the one the school will be quoted.
- * It counts indexes and table bloat as well as rows, which is the honest
- * answer to "how much room are we using".
+ * `dbStats` is what Atlas bills against and what its console shows, so the
+ * figure here matches the one the school will be quoted. `storageSize` counts
+ * what the collections occupy on disk and `indexSize` the indexes over them —
+ * together, the honest answer to "how much room are we using", rather than the
+ * smaller `dataSize` which ignores both indexes and the space already claimed.
  */
 async function databaseBytes() {
-  const size = Number(await scalar('SELECT pg_database_size(current_database())') || 0);
-  if (size) return size;
-  // A managed role without CONNECT-level introspection can be refused that;
-  // summing the tables we know about is a reasonable second answer.
   try {
-    return Number(await scalar(
-      `SELECT COALESCE(SUM(pg_total_relation_size(quote_ident(table_name))), 0)
-         FROM information_schema.tables WHERE table_schema = 'public'`
-    ) || 0);
+    const stats = await mongoose.connection.db.stats();
+    return Number(stats.storageSize || 0) + Number(stats.indexSize || 0);
   } catch {
+    // A user without the stats privilege is refused; the panel should still
+    // draw, with the uploads figure it can get.
     return 0;
   }
 }
@@ -110,7 +109,7 @@ function uploadBytes() {
 
 /** The configured ceiling, in bytes. */
 async function limitBytes() {
-  const row = await get("SELECT value FROM system_settings WHERE key = 'storage_limit_mb'");
+  const row = await SystemSetting.findOne({ key: 'storage_limit_mb' }).select('value').lean();
   const mb = Number(row?.value);
   return (Number.isFinite(mb) && mb > 0 ? mb : DEFAULT_LIMIT_MB) * 1024 * 1024;
 }
@@ -129,7 +128,7 @@ router.get(
 
     const counted = await Promise.all(
       TRACKED.map(async ([table, label]) =>
-        ((await tableExists(table)) ? { table, label, rows: await rowsIn(table) } : null))
+        (modelFor(table) ? { table, label, rows: await rowsIn(table) } : null))
     );
     const tables = counted.filter(Boolean).sort((a, b) => b.rows - a.rows);
 
@@ -142,14 +141,7 @@ router.get(
       /** Warn before it becomes a problem rather than after. */
       state: used >= limit ? 'FULL' : used >= limit * 0.8 ? 'NEAR' : 'OK',
       tables,
-      years: await all(
-        `SELECT y.id, y.name, y.start_date, y.end_date, y.is_current,
-                (SELECT COUNT(*) FROM enrollments e WHERE e.academic_year_id = y.id) AS enrollments,
-                (SELECT COUNT(*) FROM timetables t WHERE t.academic_year_id = y.id) AS timetable_slots,
-                (SELECT COUNT(*) FROM examinations x WHERE x.academic_year_id = y.id) AS examinations
-           FROM academic_years y
-          ORDER BY y.start_date DESC`
-      ),
+      years: await yearsBreakdown(),
     });
   })
 );
@@ -171,8 +163,8 @@ const PURGES = {
   // clears the ones that only ever fail.
   dead_devices: {
     label: 'Device notification registrations that keep failing',
-    count: async () => Number(await scalar('SELECT COUNT(*) AS n FROM push_subscriptions WHERE failures >= 5') || 0),
-    run: async () => (await run('DELETE FROM push_subscriptions WHERE failures >= 5')).changes,
+    count: async () => PushSubscription.countDocuments({ failures: { $gte: 5 } }),
+    run: async () => (await PushSubscription.deleteMany({ failures: { $gte: 5 } })).deletedCount,
   },
   audit_logs: {
     label: 'Audit trail older than the chosen age',
@@ -181,21 +173,17 @@ const PURGES = {
   },
   notifications: {
     label: 'Notifications already read',
-    count: async (days) =>
-      Number(
-        await scalar(
-          `SELECT COUNT(*) FROM notifications WHERE is_read = 1 AND substr(created_at, 1, 10) < to_char((now() AT TIME ZONE 'UTC') + (?)::interval, 'YYYY-MM-DD')`,
-          [`-${days} days`]
-        ) || 0
-      ),
+    count: async (days) => Notification.countDocuments({ is_read: 1, created_at: { $lt: cutoff(days) } }),
     run: async (days) =>
-      (await run(`DELETE FROM notifications WHERE is_read = 1 AND substr(created_at, 1, 10) < to_char((now() AT TIME ZONE 'UTC') + (?)::interval, 'YYYY-MM-DD')`, [`-${days} days`]))
-        .changes,
+      (await Notification.deleteMany({ is_read: 1, created_at: { $lt: cutoff(days) } })).deletedCount,
   },
   sessions: {
     label: 'Expired sign-in sessions',
-    count: async () => Number(await scalar('SELECT COUNT(*) FROM refresh_tokens WHERE expires_at::timestamptz < now()') || 0),
-    run: async () => (await run('DELETE FROM refresh_tokens WHERE expires_at::timestamptz < now()')).changes,
+    // Expiry is written as an ISO instant by lib/auth.js, so comparing it as
+    // text gives the same answer as comparing the instants.
+    count: async () => RefreshToken.countDocuments({ expires_at: { $lt: new Date().toISOString() } }),
+    run: async () =>
+      (await RefreshToken.deleteMany({ expires_at: { $lt: new Date().toISOString() } })).deletedCount,
   },
   messages: {
     label: 'Messages older than the chosen age',
@@ -204,14 +192,51 @@ const PURGES = {
   },
 };
 
+/**
+ * The day this many days ago, as the timestamps are written.
+ *
+ * Those are text, in a fixed format that sorts with the instants it denotes,
+ * so "older than" is a string comparison — which is what substr() made of it
+ * before.
+ */
+const cutoff = (days) =>
+  new Date(Date.now() - Math.max(0, Number(days) || 0) * 86400000)
+    .toISOString().slice(0, 10);
+
 async function rowsOlderThan(table, column, days) {
-  if (!await tableExists(table)) return 0;
-  return Number(await scalar(`SELECT COUNT(*) FROM ${table} WHERE substr(${column}, 1, 10) < to_char((now() AT TIME ZONE 'UTC') + (?)::interval, 'YYYY-MM-DD')`, [`-${days} days`]) || 0);
+  const Model = modelFor(table);
+  return Model ? Model.countDocuments({ [column]: { $lt: cutoff(days) } }) : 0;
 }
 
 async function deleteOlderThan(table, column, days) {
-  if (!await tableExists(table)) return 0;
-  return (await run(`DELETE FROM ${table} WHERE substr(${column}, 1, 10) < to_char((now() AT TIME ZONE 'UTC') + (?)::interval, 'YYYY-MM-DD')`, [`-${days} days`])).changes;
+  const Model = modelFor(table);
+  if (!Model) return 0;
+  return (await Model.deleteMany({ [column]: { $lt: cutoff(days) } })).deletedCount;
+}
+
+/**
+ * What each academic year is carrying.
+ *
+ * Three correlated subqueries became three grouped queries — the years
+ * themselves are few, but a count per year per measure is not.
+ */
+async function yearsBreakdown() {
+  const years = plain(await AcademicYear.find({}).sort({ start_date: -1 }));
+  const countByYear = async (Model) => {
+    const rows = await Model.aggregate([{ $group: { _id: '$academic_year_id', n: { $sum: 1 } } }]);
+    return new Map(rows.map((r) => [String(r._id), r.n]));
+  };
+  const [enrolments, slots, exams] = await Promise.all([
+    countByYear(Enrollment),
+    countByYear(Timetable),
+    countByYear(Examination),
+  ]);
+  return years.map((y) => ({
+    ...y,
+    enrollments: enrolments.get(y.id) ?? 0,
+    timetable_slots: slots.get(y.id) ?? 0,
+    examinations: exams.get(y.id) ?? 0,
+  }));
 }
 
 /** What each purge would remove, so nothing is confirmed blind. */
@@ -250,8 +275,12 @@ router.post(
       total += count;
     }
 
-    // Reclaim the freed pages, or the file stays the size it grew to.
-    await exec('VACUUM');
+    /*
+     * No VACUUM. PostgreSQL had to be told to reclaim the freed pages or the
+     * file stayed the size it had grown to; MongoDB reuses that space itself,
+     * and the equivalent (compact) takes the database offline while it runs —
+     * not a trade worth making at the moment somebody has just tidied up.
+     */
 
     await logActivity({
       req,
@@ -275,34 +304,46 @@ router.post(
  */
 router.post(
   '/purge-year',
-  validateBody(z.object({ academic_year_id: z.coerce.number().int().positive(), confirm: z.literal('CLEAR') })),
+  validateBody(z.object({ academic_year_id: z.string().min(1), confirm: z.literal('CLEAR') })),
   asyncHandler(async (req, res) => {
-    const year = await get('SELECT * FROM academic_years WHERE id = ?', [req.body.academic_year_id]);
+    const yearId = oid(req.body.academic_year_id);
+    const year = yearId ? plain(await AcademicYear.findById(yearId)) : null;
     if (!year) throw notFound('Academic year not found');
     if (year.is_current) throw badRequest('The current academic year cannot be cleared.');
 
     const removed = {};
-    // Order matters: the rows that reference an examination go before it does.
+
+    /*
+     * Order matters: what refers to an examination goes before the
+     * examination does. Nothing enforces that now — MongoDB would let a mark
+     * outlive the exam it belongs to and simply read back as an orphan — so
+     * the order is the guarantee, and it is worth keeping deliberate.
+     *
+     * The subqueries become two lookups: the examinations of this year, then
+     * their subjects. Done once here rather than repeated inside each step.
+     */
+    const examinations = await Examination.find({ academic_year_id: yearId }).select('_id').lean();
+    const examIds = examinations.map((x) => x._id);
+    const examSubjects = examIds.length
+      ? await ExamSubject.find({ examination_id: { $in: examIds } }).select('_id').lean()
+      : [];
+    const examSubjectIds = examSubjects.map((es) => es._id);
+
     const steps = [
-      ['marks', `DELETE FROM marks WHERE exam_subject_id IN (
-                   SELECT es.id FROM exam_subjects es
-                    JOIN examinations x ON x.id = es.examination_id
-                   WHERE x.academic_year_id = ?)`],
-      ['results', `DELETE FROM results WHERE examination_id IN (
-                     SELECT id FROM examinations WHERE academic_year_id = ?)`],
-      ['exam_subjects', `DELETE FROM exam_subjects WHERE examination_id IN (
-                           SELECT id FROM examinations WHERE academic_year_id = ?)`],
-      ['examinations', 'DELETE FROM examinations WHERE academic_year_id = ?'],
-      ['timetables', 'DELETE FROM timetables WHERE academic_year_id = ?'],
-      ['course_assignments', 'DELETE FROM course_assignments WHERE academic_year_id = ?'],
-      ['enrollments', 'DELETE FROM enrollments WHERE academic_year_id = ?'],
+      ['marks', Mark, { exam_subject_id: { $in: examSubjectIds } }],
+      ['results', Result, { examination_id: { $in: examIds } }],
+      ['exam_subjects', ExamSubject, { examination_id: { $in: examIds } }],
+      ['examinations', Examination, { academic_year_id: yearId }],
+      ['timetables', Timetable, { academic_year_id: yearId }],
+      ['course_assignments', CourseAssignment, { academic_year_id: yearId }],
+      ['enrollments', Enrollment, { academic_year_id: yearId }],
     ];
 
-    for (const [name, sql] of steps) {
-      if (!await tableExists(name)) continue;
-      removed[name] = (await run(sql, [year.id])).changes;
+    for (const [name, Model, filter] of steps) {
+      removed[name] = (await Model.deleteMany(filter)).deletedCount;
     }
-    await exec('VACUUM');
+    // No VACUUM: MongoDB reclaims space itself, and asking it to compact
+    // blocks the database, which is not a trade a school wants at this moment.
 
     await logActivity({
       req,
