@@ -23,7 +23,9 @@
  * the section is id 17. Lookups resolve what a person would actually type.
  */
 import { Router } from 'express';
-import { all, get, insert, run, transaction } from '../db/connection.js';
+import { AcademicYear, Class, Department, Enrollment, Faculty, Parent, Role, Section, Student, StudentParent, User } from '../db/mongo/models.js';
+import { oid, transaction } from '../db/mongo/connection.js';
+import { plain } from '../db/mongo/query.js';
 import { asyncHandler, ok } from '../lib/http.js';
 import { badRequest } from '../lib/errors.js';
 import { requireRole, requirePermission } from '../middleware/auth.js';
@@ -130,29 +132,25 @@ const ENTITIES = {
     ],
 
     async prepare(campusId) {
-      const classes = await all(
-        `SELECT id, name, board, numeric_level FROM classes WHERE campus_id = ? AND status = 'ACTIVE'`,
-        [campusId]
+      const classes = plain(
+        await Class.find({ campus_id: oid(campusId), status: 'ACTIVE' })
+          .select('name board numeric_level')
       );
-      const sections = await all(
-        `SELECT s.id, s.name, s.class_id FROM sections s
-           JOIN classes c ON c.id = s.class_id
-          WHERE s.campus_id = ? AND s.status = 'ACTIVE'`,
-        [campusId]
+      const sections = plain(
+        await Section.find({ campus_id: oid(campusId), status: 'ACTIVE' })
+          .select('name class_id')
       );
-      const year = await get(
-        `SELECT id FROM academic_years WHERE campus_id = ? AND is_current = 1`,
-        [campusId]
-      );
+      const year = await AcademicYear.findOne({ campus_id: oid(campusId), is_current: 1 })
+        .select('_id').lean();
       return {
         classes,
         classIndex: index(classes, ['name']),
         sections,
-        academicYearId: year?.id ?? null,
+        academicYearId: year ? String(year._id) : null,
         admissions: await admissionNumbers(campusId),
         parents: await parentCodes(campusId),
         usernames: await usernameAllocator(),
-        parentRole: await get("SELECT id FROM roles WHERE code = 'PARENT'"),
+        parentRole: await Role.findOne({ code: 'PARENT' }).select('_id').lean(),
       };
     },
 
@@ -224,8 +222,9 @@ const ENTITIES = {
     },
 
     async write(data, planned, ctx, req, campusId) {
-      const studentId = await insert('students', {
-        campus_id: campusId,
+      const opts = ctx.session ? { session: ctx.session } : {};
+      const [student] = await Student.create([{
+        campus_id: oid(campusId),
         admission_number: planned.admission_number,
         roll_number: data.roll_number,
         first_name: data.first_name,
@@ -233,9 +232,9 @@ const ENTITIES = {
         date_of_birth: data.date_of_birth,
         gender: data.gender,
         blood_group: data.blood_group,
-        class_id: data.class_id,
-        section_id: data.section_id,
-        academic_year_id: ctx.academicYearId,
+        class_id: oid(data.class_id),
+        section_id: oid(data.section_id),
+        academic_year_id: oid(ctx.academicYearId),
         board: data.board,
         phone: data.phone,
         email: data.email,
@@ -249,35 +248,42 @@ const ENTITIES = {
         previous_school: data.previous_school,
         admission_date: data.admission_date || new Date().toISOString().slice(0, 10),
         status: 'ACTIVE',
-      });
+      }], opts);
+      const studentId = student._id;
 
       if (ctx.academicYearId && data.class_id && data.section_id) {
-        await run(
-          `INSERT INTO enrollments (campus_id, student_id, academic_year_id, class_id, section_id, roll_number)
-           VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING`,
-          [campusId, studentId, ctx.academicYearId, data.class_id, data.section_id, data.roll_number]
-        );
+        // A repeated enrolment was refused by the unique key rather than
+        // failing the import; the same here.
+        await Enrollment.create([{
+          campus_id: oid(campusId),
+          student_id: studentId,
+          academic_year_id: oid(ctx.academicYearId),
+          class_id: oid(data.class_id),
+          section_id: oid(data.section_id),
+          roll_number: data.roll_number,
+        }], opts).catch((error) => { if (error?.code !== 11000) throw error; });
       }
 
       if (data.parent) {
         let parentUserId = null;
         if (planned.parent_username) {
-          parentUserId = await insert('users', {
+          const [parentAccount] = await User.create([{
             username: planned.parent_username,
             email: data.parent.email || `${planned.parent_username}@parent.vignan.edu`,
             password_hash: ctx.passwordHash,
             full_name: data.parent.father_name || data.parent.mother_name || 'Parent',
             phone: data.parent.phone,
-            role_id: ctx.parentRole.id,
-            campus_id: campusId,
+            role_id: ctx.parentRole?._id,
+            campus_id: oid(campusId),
             status: 'ACTIVE',
             must_change_password: 1,
-            created_by: req.user.id,
-          });
+            created_by: oid(req.user.id),
+          }], opts);
+          parentUserId = parentAccount._id;
         }
-        const parentId = await insert('parents', {
+        const [family] = await Parent.create([{
           user_id: parentUserId,
-          campus_id: campusId,
+          campus_id: oid(campusId),
           parent_code: planned.parent_code,
           father_name: data.parent.father_name,
           mother_name: data.parent.mother_name,
@@ -285,15 +291,17 @@ const ENTITIES = {
           email: data.parent.email,
           relation: 'FATHER',
           address: data.address,
-        });
-        await run(
-          `INSERT INTO student_parents (student_id, parent_id, relation, is_primary)
-           VALUES (?, ?, 'FATHER', 1) ON CONFLICT DO NOTHING`,
-          [studentId, parentId]
-        );
+        }], opts);
+
+        await StudentParent.create([{
+          student_id: studentId,
+          parent_id: family._id,
+          relation: 'FATHER',
+          is_primary: 1,
+        }], opts).catch((error) => { if (error?.code !== 11000) throw error; });
       }
 
-      return { id: studentId, reference: planned.admission_number };
+      return { id: String(studentId), reference: planned.admission_number };
     },
   },
 
@@ -318,15 +326,17 @@ const ENTITIES = {
     ],
 
     async prepare(campusId) {
-      const departments = await all('SELECT id, name, code FROM departments WHERE campus_id = ?', [campusId]);
+      const departments = plain(
+        await Department.find({ campus_id: oid(campusId) }).select('name code')
+      );
       return {
         departments,
         departmentIndex: index(departments, ['name', 'code']),
         teaching: await facultyCodes(campusId, 'TEACHING'),
         financial: await facultyCodes(campusId, 'FINANCIAL'),
         usernames: await usernameAllocator(),
-        teachingRole: await get("SELECT id FROM roles WHERE code = 'TEACHING_STAFF'"),
-        financialRole: await get("SELECT id FROM roles WHERE code = 'FINANCIAL_STAFF'"),
+        teachingRole: await Role.findOne({ code: 'TEACHING_STAFF' }).select('_id').lean(),
+        financialRole: await Role.findOne({ code: 'FINANCIAL_STAFF' }).select('_id').lean(),
       };
     },
 
@@ -380,8 +390,9 @@ const ENTITIES = {
     },
 
     async write(data, planned, ctx, req, campusId) {
-      const roleId = data.staff_type === 'TEACHING' ? ctx.teachingRole.id : ctx.financialRole.id;
-      const userId = await insert('users', {
+      const opts = ctx.session ? { session: ctx.session } : {};
+      const roleId = data.staff_type === 'TEACHING' ? ctx.teachingRole?._id : ctx.financialRole?._id;
+      const [account] = await User.create([{
         username: planned.username,
         email: data.email || `${planned.username}@vignan.edu`,
         password_hash: ctx.passwordHash,
@@ -389,28 +400,29 @@ const ENTITIES = {
         phone: data.phone,
         gender: data.gender,
         role_id: roleId,
-        campus_id: campusId,
+        campus_id: oid(campusId),
         status: 'ACTIVE',
         must_change_password: 1,
-        created_by: req.user.id,
-      });
+        created_by: oid(req.user.id),
+      }], opts);
+      const userId = account._id;
 
-      const facultyId = await insert('faculty', {
+      const [member] = await Faculty.create([{
         user_id: userId,
-        campus_id: campusId,
+        campus_id: oid(campusId),
         faculty_code: planned.faculty_code,
         staff_type: data.staff_type,
         board: data.board,
-        department_id: data.department_id,
+        department_id: oid(data.department_id),
         designation: data.designation,
         qualification: data.qualification,
         specialization: data.specialization,
         experience_years: data.experience_years,
         date_of_joining: data.date_of_joining || new Date().toISOString().slice(0, 10),
         status: 'ACTIVE',
-      });
+      }], opts);
 
-      return { id: facultyId, reference: planned.faculty_code };
+      return { id: String(member._id), reference: planned.faculty_code };
     },
   },
 };
@@ -548,14 +560,22 @@ router.post(
     }
     if (!valid.length) throw badRequest('There is nothing left to import');
 
-    // One transaction: a failure part-way leaves the school where it started.
-    const written = await transaction(async () => {
+    /*
+     * One transaction: a failure part-way leaves the school where it started.
+     *
+     * This matters more here than anywhere else in the application. A file of
+     * four hundred pupils that stops at row two hundred and ten would leave
+     * half a year group enrolled, with no way to tell which half without
+     * reading the file against the database row by row. The session is passed
+     * down to every write so they all belong to it.
+     */
+    const written = await transaction(async (session) => {
       const results = [];
       for (const row of valid) {
-        results.push(await entity.write(row.data, row.planned, ctx, req, campusId));
+        results.push(await entity.write(row.data, row.planned, { ...ctx, session }, req, campusId));
       }
       return results;
-    })();
+    });
 
     await logActivity({
       req,
