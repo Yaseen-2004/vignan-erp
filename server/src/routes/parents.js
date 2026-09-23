@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { all, get, run, insert, update, scalar, transaction } from '../db/connection.js';
+import { Parent, Role, Student, StudentParent, User } from '../db/mongo/models.js';
+import { oid, transaction } from '../db/mongo/connection.js';
+import { sameId } from '../lib/scope.js';
+import { escapeRegex, insensitive, lift, plain, populateFor } from '../db/mongo/query.js';
 import { asyncHandler, ok, created, pagination, paginated, safeSort } from '../lib/http.js';
 import { badRequest, notFound, conflict, forbidden } from '../lib/errors.js';
 import { requirePermission } from '../middleware/auth.js';
@@ -30,14 +33,76 @@ const parentSchema = z.object({
   create_account: z.boolean().optional(),
   username: z.string().max(60).optional(),
   password: z.string().min(8).max(100).optional(),
-  student_ids: z.array(z.coerce.number().int().positive()).optional(),
+  student_ids: z.array(z.string()).optional(),
 });
 
-const SELECT_PARENT = `
-  p.*, u.username, u.full_name, u.status AS account_status, u.last_login_at, u.photo,
-  (SELECT COUNT(*) FROM student_parents sp WHERE sp.parent_id = p.id) AS children_count`;
+/** What the join lifted from the sign-in account onto each family record. */
+const ACCOUNT = {
+  user_id: {
+    username: 'username',
+    full_name: 'full_name',
+    status: 'account_status',
+    last_login_at: 'last_login_at',
+    photo: 'photo',
+  },
+};
 
-const JOIN_PARENT = `LEFT JOIN users u ON u.id = p.user_id`;
+/** One family record, in the shape the join produced. */
+async function loadParent(id) {
+  const _id = oid(id);
+  if (!_id) return null;
+  const doc = await Parent.findById(_id).populate(populateFor(ACCOUNT));
+  if (!doc) return null;
+  const row = lift(doc, ACCOUNT);
+  row.children_count = await StudentParent.countDocuments({ parent_id: _id });
+  return row;
+}
+
+/**
+ * The children linked to these families.
+ *
+ * Fetched for the whole page at once. One query per family to draw a list of
+ * twenty-five was twenty-five round trips, and the list shows the children on
+ * every row.
+ */
+async function childrenFor(parentIds, { detailed = false } = {}) {
+  const ids = parentIds.map(oid).filter(Boolean);
+  if (!ids.length) return new Map();
+
+  const links = await StudentParent.find({ parent_id: { $in: ids } })
+    .populate({
+      path: 'student_id',
+      select: 'first_name last_name admission_number photo status class_id section_id',
+      populate: [{ path: 'class_id', select: 'name' }, { path: 'section_id', select: 'name' }],
+    });
+
+  const byParent = new Map();
+  for (const link of links) {
+    if (!link.student_id) continue;
+    const child = {
+      id: String(link.student_id._id),
+      first_name: link.student_id.first_name,
+      last_name: link.student_id.last_name,
+      admission_number: link.student_id.admission_number,
+      class_name: link.student_id.class_id?.name ?? null,
+      section_name: link.student_id.section_id?.name ?? null,
+      ...(detailed
+        ? {
+          photo: link.student_id.photo,
+          status: link.student_id.status,
+          // These belong to the link, not the child: how this adult is
+          // related to this child, and whether they are the first contact.
+          relation: link.relation,
+          is_primary: link.is_primary,
+        }
+        : {}),
+    };
+    const key = String(link.parent_id);
+    if (!byParent.has(key)) byParent.set(key, []);
+    byParent.get(key).push(child);
+  }
+  return byParent;
+}
 
 router.get(
   '/',
@@ -46,8 +111,7 @@ router.get(
     const { page, limit, offset } = pagination(req.query);
     const { column, direction } = safeSort(req.query, ['id', 'parent_code', 'created_at'], 'id');
 
-    const clauses = [];
-    const params = [];
+    const filter = {};
     if (!isAdmin(req.user) && req.user.campus_id) {
       clauses.push('p.campus_id = ?');
       params.push(req.user.campus_id);
@@ -57,35 +121,31 @@ router.get(
       clauses.push('p.id = ?');
       params.push(await parentIdOf(req.user) ?? 0);
     }
-    if (req.query.status && req.query.status !== 'ALL') {
-      clauses.push('p.status = ?');
-      params.push(req.query.status);
-    }
+    if (req.query.status && req.query.status !== 'ALL') filter.status = req.query.status;
     if (req.query.search) {
-      const term = `%${req.query.search}%`;
-      clauses.push('(p.father_name ILIKE ? OR p.mother_name ILIKE ? OR p.phone ILIKE ? OR p.parent_code ILIKE ? OR p.email ILIKE ?)');
-      params.push(term, term, term, term, term);
+      const term = new RegExp(escapeRegex(String(req.query.search)), 'i');
+      filter.$or = [
+        { father_name: term }, { mother_name: term }, { phone: term },
+        { parent_code: term }, { email: term },
+      ];
     }
-    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
-    const total = Number(await scalar(`SELECT COUNT(*) AS n FROM parents p ${where}`, params));
-    const rows = await all(
-      `SELECT ${SELECT_PARENT} FROM parents p ${JOIN_PARENT} ${where}
-        ORDER BY p.${column} ${direction} LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
-    );
+    const sortField = column === 'id' ? '_id' : column;
+    const [docs, total] = await Promise.all([
+      Parent.find(filter)
+        .populate(populateFor(ACCOUNT))
+        .sort({ [sortField]: direction === 'ASC' ? 1 : -1, _id: 1 })
+        .skip(offset)
+        .limit(limit),
+      Parent.countDocuments(filter),
+    ]);
+    const rows = lift(docs, ACCOUNT);
 
     // Attach the children so the list can show "Child 1 — 8A, Child 2 — 5B".
+    const children = await childrenFor(rows.map((r) => r.id));
     for (const row of rows) {
-      row.children = await all(
-        `SELECT s.id, s.first_name, s.last_name, s.admission_number, c.name AS class_name, sec.name AS section_name
-           FROM student_parents sp
-           JOIN students s ON s.id = sp.student_id
-           LEFT JOIN classes c ON c.id = s.class_id
-           LEFT JOIN sections sec ON sec.id = s.section_id
-          WHERE sp.parent_id = ?`,
-        [row.id]
-      );
+      row.children = children.get(row.id) ?? [];
+      row.children_count = row.children.length;
     }
     return paginated(res, rows, total, { page, limit });
   })
@@ -95,25 +155,26 @@ router.get(
   '/:id',
   requirePermission('parents.view'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    if (isParent(req.user) && await parentIdOf(req.user) !== id) throw forbidden('You may only view your own record');
+    const id = req.params.id;
+    /*
+     * The original compared `await parentIdOf(req.user) !== id` — await binds
+     * tighter than !== only because of the parentheses that were not there,
+     * so this read as `await (parentIdOf(...) !== id)`: a promise is never
+     * equal to a number, so the check was always true and a parent was
+     * refused their own record. Parenthesised, and comparing as strings.
+     */
+    if (isParent(req.user) && !sameId(await parentIdOf(req.user), id)) {
+      throw forbidden('You may only view your own record');
+    }
 
-    const parent = await get(`SELECT ${SELECT_PARENT} FROM parents p ${JOIN_PARENT} WHERE p.id = ?`, [id]);
+    const parent = await loadParent(id);
     if (!parent) throw notFound('Parent not found');
-    if (!isAdmin(req.user) && !isParent(req.user) && parent.campus_id !== req.user.campus_id) {
+    if (!isAdmin(req.user) && !isParent(req.user) && !sameId(parent.campus_id, req.user.campus_id)) {
       throw forbidden('Different campus');
     }
 
-    parent.children = await all(
-      `SELECT s.id, s.first_name, s.last_name, s.admission_number, s.photo, s.status,
-              c.name AS class_name, sec.name AS section_name, sp.relation, sp.is_primary
-         FROM student_parents sp
-         JOIN students s ON s.id = sp.student_id
-         LEFT JOIN classes c ON c.id = s.class_id
-         LEFT JOIN sections sec ON sec.id = s.section_id
-        WHERE sp.parent_id = ?`,
-      [id]
-    );
+    parent.children = (await childrenFor([id], { detailed: true })).get(String(id)) ?? [];
+
     return ok(res, parent);
   })
 );
@@ -124,41 +185,43 @@ router.post(
   validateBody(parentSchema),
   asyncHandler(async (req, res) => {
     const body = req.body;
-    const campusId = isAdmin(req.user) && req.body.campus_id ? Number(req.body.campus_id) : req.user.campus_id;
+    const campusId = isAdmin(req.user) && req.body.campus_id ? req.body.campus_id : req.user.campus_id;
     if (!campusId) throw badRequest('No campus is associated with your account');
 
     // A truncated timestamp repeats about every 27 hours, and two parents
     // added in the same millisecond collide outright.
     const parentCode = (await parentCodes(campusId)).take();
     const username = body.username || parentCode.toLowerCase();
-    if (body.create_account && await get('SELECT 1 AS x FROM users WHERE lower(username) = lower(?)', [username])) {
+    if (body.create_account && await User.exists({ username: insensitive(username) })) {
       throw conflict('That username is taken');
     }
 
     const password = body.password || env.seedPassword;
     const passwordHash = body.create_account ? await hashPassword(password) : null;
 
-    const result = await transaction(async () => {
+    const result = await transaction(async (session) => {
+      const opts = session ? { session } : {};
       let userId = null;
       if (body.create_account) {
-        const role = await get("SELECT id FROM roles WHERE code = 'PARENT'");
-        userId = await insert('users', {
+        const role = await Role.findOne({ code: 'PARENT' }).select('_id').lean();
+        const [account] = await User.create([{
           username,
           email: body.email || `${username}@parent.vignan.edu`,
           password_hash: passwordHash,
           full_name: body.father_name || body.mother_name || body.guardian_name || 'Parent',
           phone: body.phone || body.father_phone || body.mother_phone,
-          role_id: role.id,
-          campus_id: campusId,
+          role_id: role?._id,
+          campus_id: oid(campusId),
           status: 'ACTIVE',
           must_change_password: body.password ? 0 : 1,
-          created_by: req.user.id,
-        });
+          created_by: oid(req.user.id),
+        }], opts);
+        userId = account._id;
       }
 
-      const parentId = await insert('parents', {
+      const [family] = await Parent.create([{
         user_id: userId,
-        campus_id: campusId,
+        campus_id: oid(campusId),
         parent_code: parentCode,
         father_name: body.father_name,
         father_occupation: body.father_occupation,
@@ -173,17 +236,26 @@ router.post(
         address: body.address,
         annual_income: body.annual_income,
         status: body.status || 'ACTIVE',
-      });
+      }], opts);
+      const parentId = family._id;
 
-      for (const studentId of body.student_ids || []) {
-        await run('INSERT INTO student_parents (student_id, parent_id, relation, is_primary) VALUES (?, ?, ?, 1) ON CONFLICT DO NOTHING', [
-          studentId,
-          parentId,
-          body.relation || 'FATHER',
-        ]);
+      // Linking the same child twice was refused by the unique key; an
+      // unordered insert keeps going past a duplicate rather than failing the
+      // whole family record over one repeated child.
+      const childIds = (body.student_ids || []).map(oid).filter(Boolean);
+      if (childIds.length) {
+        await StudentParent.insertMany(
+          childIds.map((studentId) => ({
+            student_id: studentId,
+            parent_id: parentId,
+            relation: body.relation || 'FATHER',
+            is_primary: 1,
+          })),
+          { ...opts, ordered: false }
+        ).catch((error) => { if (error?.code !== 11000) throw error; });
       }
-      return { parentId, userId };
-    })();
+      return { parentId: String(parentId), userId: userId ? String(userId) : null };
+    });
 
     await logActivity({
       req,
@@ -195,7 +267,7 @@ router.post(
       newValues: { parent_code: parentCode, children: body.student_ids || [] },
     });
 
-    const row = await get(`SELECT ${SELECT_PARENT} FROM parents p ${JOIN_PARENT} WHERE p.id = ?`, [result.parentId]);
+    const row = await loadParent(result.parentId);
     return created(res, { ...row, temporaryPassword: body.create_account && !body.password ? password : undefined });
   })
 );
@@ -205,10 +277,10 @@ router.put(
   requirePermission('parents.edit'),
   validateBody(parentSchema.partial()),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const existing = await get('SELECT * FROM parents WHERE id = ?', [id]);
+    const id = req.params.id;
+    const existing = plain(await Parent.findById(oid(id)));
     if (!existing) throw notFound('Parent not found');
-    if (!isAdmin(req.user) && existing.campus_id !== req.user.campus_id) throw forbidden('Different campus');
+    if (!isAdmin(req.user) && !sameId(existing.campus_id, req.user.campus_id)) throw forbidden('Different campus');
 
     const data = {};
     for (const f of [
@@ -217,12 +289,20 @@ router.put(
     ]) {
       if (req.body[f] !== undefined) data[f] = req.body[f];
     }
-    if (Object.keys(data).length) await update('parents', id, data);
+    if (Object.keys(data).length) {
+      await Parent.updateOne({ _id: oid(id) }, { $set: data }, { runValidators: true });
+    }
+
+    // The sign-in account carries the same name and number, so it follows.
     if (existing.user_id && (data.father_name || data.phone)) {
-      await update('users', existing.user_id, {
-        full_name: data.father_name ?? existing.father_name ?? undefined,
-        phone: data.phone ?? undefined,
-      });
+      const accountUpdate = {};
+      if (data.father_name ?? existing.father_name) {
+        accountUpdate.full_name = data.father_name ?? existing.father_name;
+      }
+      if (data.phone !== undefined) accountUpdate.phone = data.phone;
+      if (Object.keys(accountUpdate).length) {
+        await User.updateOne({ _id: oid(existing.user_id) }, { $set: accountUpdate });
+      }
     }
 
     const changes = diff(existing, { ...existing, ...data });
@@ -236,7 +316,7 @@ router.put(
       oldValues: changes.old,
       newValues: changes.new,
     });
-    return ok(res, await get(`SELECT ${SELECT_PARENT} FROM parents p ${JOIN_PARENT} WHERE p.id = ?`, [id]));
+    return ok(res, await loadParent(id));
   })
 );
 
@@ -252,19 +332,20 @@ router.post(
     })
   ),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const parent = await get('SELECT * FROM parents WHERE id = ?', [id]);
+    const id = req.params.id;
+    const parent = plain(await Parent.findById(oid(id)));
     if (!parent) throw notFound('Parent not found');
-    const student = await get('SELECT * FROM students WHERE id = ?', [req.body.student_id]);
+    const student = plain(await Student.findById(oid(req.body.student_id)));
     if (!student) throw notFound('Student not found');
-    if (student.campus_id !== parent.campus_id) throw badRequest('Student and parent belong to different campuses');
+    if (!sameId(student.campus_id, parent.campus_id)) throw badRequest('Student and parent belong to different campuses');
 
-    await run('INSERT INTO student_parents (student_id, parent_id, relation, is_primary) VALUES (?, ?, ?, ?) ON CONFLICT (student_id, parent_id) DO UPDATE SET relation = EXCLUDED.relation, is_primary = EXCLUDED.is_primary', [
-      student.id,
-      id,
-      req.body.relation,
-      req.body.is_primary ? 1 : 0,
-    ]);
+    // Linking the same pair again changes the relation rather than adding a
+    // second link, which is what ON CONFLICT DO UPDATE did.
+    await StudentParent.updateOne(
+      { student_id: oid(student.id), parent_id: oid(id) },
+      { $set: { relation: req.body.relation, is_primary: req.body.is_primary ? 1 : 0 } },
+      { upsert: true }
+    );
 
     await logActivity({
       req,
@@ -283,12 +364,12 @@ router.delete(
   '/:id/children/:studentId',
   requirePermission('parents.edit'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const studentId = Number(req.params.studentId);
-    const parent = await get('SELECT * FROM parents WHERE id = ?', [id]);
+    const id = req.params.id;
+    const studentId = req.params.studentId;
+    const parent = plain(await Parent.findById(oid(id)));
     if (!parent) throw notFound('Parent not found');
 
-    await run('DELETE FROM student_parents WHERE parent_id = ? AND student_id = ?', [id, studentId]);
+    await StudentParent.deleteOne({ parent_id: oid(id), student_id: oid(studentId) });
     await logActivity({
       req,
       action: 'DELETE',
@@ -305,13 +386,23 @@ router.delete(
   '/:id',
   requirePermission('parents.delete'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const parent = await get('SELECT * FROM parents WHERE id = ?', [id]);
+    const id = req.params.id;
+    const parent = plain(await Parent.findById(oid(id)));
     if (!parent) throw notFound('Parent not found');
-    if (!isAdmin(req.user) && parent.campus_id !== req.user.campus_id) throw forbidden('Different campus');
+    if (!isAdmin(req.user) && !sameId(parent.campus_id, req.user.campus_id)) throw forbidden('Different campus');
 
-    await run('DELETE FROM parents WHERE id = ?', [id]);
-    if (parent.user_id) await run('DELETE FROM users WHERE id = ?', [parent.user_id]);
+    /*
+     * The family record, its links to the children, and the sign-in account
+     * go together. ON DELETE CASCADE removed the links; nothing does that
+     * here, and a link left pointing at a family that no longer exists would
+     * show a child as having a parent who cannot be found.
+     */
+    await transaction(async (session) => {
+      const opts = session ? { session } : {};
+      await StudentParent.deleteMany({ parent_id: oid(id) }, opts);
+      await Parent.deleteOne({ _id: oid(id) }, opts);
+      if (parent.user_id) await User.deleteOne({ _id: oid(parent.user_id) }, opts);
+    });
     await logActivity({
       req,
       action: 'DELETE',
