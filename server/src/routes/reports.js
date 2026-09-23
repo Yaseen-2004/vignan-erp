@@ -1,7 +1,9 @@
 import { Router } from 'express';
 import ExcelJS from 'exceljs';
 import PDFDocument from 'pdfkit';
-import { all, get, scalar } from '../db/connection.js';
+import { ActivityLog, Attendance, Campus, Class, Course, CourseAssignment, Faculty, FeePayment, FeeReceipt, FuelRecord, InventoryItem, Mark, Payroll, Result, Route, Section, Student, StudentFee, TransportAllocation, VehicleMaintenance } from '../db/mongo/models.js';
+import { oid } from '../db/mongo/connection.js';
+import { plain } from '../db/mongo/query.js';
 import { asyncHandler, ok } from '../lib/http.js';
 import { badRequest, forbidden, notFound } from '../lib/errors.js';
 import { requirePermission } from '../middleware/auth.js';
@@ -12,37 +14,65 @@ import { isAdmin, accessibleStudentIds, facultyIdOf, isTeacher } from '../lib/sc
 const router = Router();
 
 /** Restrict a report to the campus of the caller. */
-function campusClause(req, column) {
-  if (isAdmin(req.user) && !req.user.campus_id) return { clause: '1 = 1', params: [] };
-  return { clause: `${column} = ?`, params: [req.user.campus_id] };
+/** Confine a report to the caller's campus, unless they run the institution. */
+function campusFilter(req, field = 'campus_id') {
+  if (isAdmin(req.user) && !req.user.campus_id) return {};
+  return { [field]: oid(req.user.campus_id) };
 }
-
-/** Restrict a student-keyed report to the students the caller may read. */
-async function studentClause(req, column) {
-  const allowed = await accessibleStudentIds(req.user);
-  if (allowed === null) return { clause: '1 = 1', params: [] };
-  if (!allowed.length) return { clause: '1 = 0', params: [] };
-  return { clause: `${column} IN (${allowed.map(() => '?').join(',')})`, params: allowed };
-}
-
-const dateRange = (req, column) => {
-  const clauses = [];
-  const params = [];
-  if (req.query.from) {
-    clauses.push(`substr(${column}, 1, 10) >= ?`);
-    params.push(req.query.from);
-  }
-  if (req.query.to) {
-    clauses.push(`substr(${column}, 1, 10) <= ?`);
-    params.push(req.query.to);
-  }
-  return { clause: clauses.length ? clauses.join(' AND ') : '1 = 1', params };
-};
 
 /**
- * Report catalogue. Each entry declares the permission it needs and returns
- * { columns, rows, summary } so every output format is driven by one query.
+ * Restrict a pupil-keyed report to the pupils the caller may read.
+ *
+ * `NONE` is what `1 = 0` said. It has to be `$expr` rather than a condition on
+ * a field: strictQuery drops a condition naming a field the collection does
+ * not have, and a dropped filter does not mean "no pupils", it means all of
+ * them — a report is exactly where that would go unnoticed.
  */
+const NONE = { $expr: { $eq: [1, 0] } };
+
+async function studentFilter(req, field = 'student_id') {
+  const allowed = await accessibleStudentIds(req.user);
+  if (allowed === null) return {};
+  if (!allowed.length) return NONE;
+  return { [field]: { $in: allowed.map(oid).filter(Boolean) } };
+}
+
+/**
+ * A date range over a date stored as text.
+ *
+ * `substr(column, 1, 10) >= from` compared the day. The same holds for a string
+ * comparison because the format is fixed and sorts with the days it denotes;
+ * the upper bound carries a suffix so "to the 9th" includes the 9th rather
+ * than stopping at its first instant.
+ */
+const dateFilter = (req, field) => {
+  const range = {};
+  if (req.query.from) range.$gte = String(req.query.from);
+  if (req.query.to) range.$lte = `${String(req.query.to)}\uffff`;
+  return Object.keys(range).length ? { [field]: range } : {};
+};
+
+/** The name a report shows, as the SQL concatenation built it. */
+const fullName = (person) =>
+  [person?.first_name, person?.last_name].filter(Boolean).join(' ');
+
+/** Rounded the way ROUND(x, 2) was. */
+const round2 = (n) => (Number.isFinite(n) ? Math.round(n * 100) / 100 : null);
+
+/**
+ * Pupils by id, with their class and section — the join every pupil-keyed
+ * report repeats. Fetched once for the ids a report actually returned.
+ */
+async function pupilsById(ids) {
+  const unique = [...new Set(ids.map(String))].map(oid).filter(Boolean);
+  if (!unique.length) return new Map();
+  const docs = await Student.find({ _id: { $in: unique } })
+    .select('admission_number first_name last_name roll_number class_id section_id')
+    .populate('class_id', 'name numeric_level')
+    .populate('section_id', 'name');
+  return new Map(docs.map((d) => [String(d._id), d]));
+}
+
 const REPORTS = {
   students: {
     title: 'Student Report',
@@ -60,37 +90,44 @@ const REPORTS = {
       { key: 'status', label: 'Status', width: 12 },
     ],
     async run(req) {
-      const campus = campusClause(req, 's.campus_id');
-      const scope = await studentClause(req, 's.id');
-      const filters = [];
-      const params = [...campus.params, ...scope.params];
-      if (req.query.class_id) {
-        filters.push('s.class_id = ?');
-        params.push(req.query.class_id);
-      }
-      if (req.query.section_id) {
-        filters.push('s.section_id = ?');
-        params.push(req.query.section_id);
-      }
-      if (req.query.status) {
-        filters.push('s.status = ?');
-        params.push(req.query.status);
-      }
-      if (req.query.board) {
-        filters.push('s.board = ?');
-        params.push(req.query.board);
-      }
-      const rows = await all(
-        `SELECT s.admission_number, (s.first_name || ' ' || COALESCE(s.last_name,'')) AS full_name,
-                s.board, c.name AS class_name, sec.name AS section_name, s.roll_number, s.gender, s.phone,
-                s.admission_date, s.status
-           FROM students s
-           LEFT JOIN classes c ON c.id = s.class_id
-           LEFT JOIN sections sec ON sec.id = s.section_id
-          WHERE ${campus.clause} AND ${scope.clause}${filters.length ? ' AND ' + filters.join(' AND ') : ''}
-          ORDER BY c.numeric_level, sec.name, (CASE WHEN s.roll_number ~ '^[0-9]+$' THEN s.roll_number::int ELSE NULL END)`,
-        params
-      );
+      const filter = {
+        ...campusFilter(req),
+        ...(await studentFilter(req, '_id')),
+      };
+      if (req.query.status) filter.status = req.query.status;
+      if (req.query.board) filter.board = req.query.board;
+
+      const docs = await Student.find(filter)
+        .select('admission_number first_name last_name board class_id section_id roll_number gender phone admission_date status')
+        .populate('class_id', 'name numeric_level')
+        .populate('section_id', 'name');
+
+      const rows = docs
+        .map((d) => ({
+          admission_number: d.admission_number,
+          full_name: fullName(d),
+          board: d.board,
+          class_name: d.class_id?.name ?? null,
+          section_name: d.section_id?.name ?? null,
+          roll_number: d.roll_number,
+          gender: d.gender,
+          phone: d.phone,
+          admission_date: d.admission_date,
+          status: d.status,
+          _level: d.class_id?.numeric_level ?? 0,
+        }))
+        /*
+         * Ordered by class, then section, then roll number *as a number* —
+         * the CASE in the SQL cast only the rolls that are digits, so that '10'
+         * follows '9' rather than preceding it. A roll that is not a number
+         * sorts last, as NULL did.
+         */
+        .sort((a, b) =>
+          a._level - b._level
+          || String(a.section_name ?? '').localeCompare(String(b.section_name ?? ''))
+          || (Number(a.roll_number) || Infinity) - (Number(b.roll_number) || Infinity))
+        .map(({ _level, ...row }) => row);
+
       return { rows, summary: { 'Total students': rows.length } };
     },
   },
@@ -109,35 +146,54 @@ const REPORTS = {
       { key: 'percentage', label: 'Attendance %', width: 14 },
     ],
     async run(req) {
-      const campus = campusClause(req, 'a.campus_id');
-      const scope = await studentClause(req, 'a.student_id');
-      const range = dateRange(req, 'a.attendance_date');
-      const params = [...campus.params, ...scope.params, ...range.params];
-      const filters = [];
-      if (req.query.section_id) {
-        filters.push('s.section_id = ?');
-        params.push(req.query.section_id);
+      const match = {
+        ...campusFilter(req),
+        ...(await studentFilter(req)),
+        ...dateFilter(req, 'attendance_date'),
+      };
+
+      // Narrowing by class or section is a property of the pupil, not of the
+      // attendance record, so the pupils are resolved first.
+      if (req.query.section_id || req.query.class_id) {
+        const pupilFilter = {};
+        if (req.query.section_id) pupilFilter.section_id = oid(req.query.section_id);
+        if (req.query.class_id) pupilFilter.class_id = oid(req.query.class_id);
+        const pupils = await Student.find(pupilFilter).select('_id').lean();
+        match.student_id = { $in: pupils.map((x) => x._id) };
       }
-      if (req.query.class_id) {
-        filters.push('s.class_id = ?');
-        params.push(req.query.class_id);
-      }
-      const rows = await all(
-        `SELECT s.admission_number, (s.first_name || ' ' || COALESCE(s.last_name,'')) AS full_name,
-                c.name AS class_name, sec.name AS section_name,
-                COUNT(*) AS total,
-                SUM(CASE WHEN a.status = 'PRESENT' THEN 1 ELSE 0 END) AS present,
-                SUM(CASE WHEN a.status = 'ABSENT' THEN 1 ELSE 0 END) AS absent,
-                ROUND(100.0 * SUM(CASE WHEN a.status = 'PRESENT' THEN 1 ELSE 0 END) / COUNT(*), 2) AS percentage
-           FROM attendance a
-           JOIN students s ON s.id = a.student_id
-           LEFT JOIN classes c ON c.id = s.class_id
-           LEFT JOIN sections sec ON sec.id = s.section_id
-          WHERE ${campus.clause} AND ${scope.clause} AND ${range.clause}${filters.length ? ' AND ' + filters.join(' AND ') : ''}
-          GROUP BY s.id, c.id, sec.id ORDER BY percentage`,
-        params
-      );
-      const average = rows.length ? (rows.reduce((sum, r) => sum + (r.percentage || 0), 0) / rows.length).toFixed(2) : 0;
+
+      const grouped = await Attendance.aggregate([
+        { $match: match },
+        {
+          $group: {
+            _id: '$student_id',
+            total: { $sum: 1 },
+            present: { $sum: { $cond: [{ $eq: ['$status', 'PRESENT'] }, 1, 0] } },
+            absent: { $sum: { $cond: [{ $eq: ['$status', 'ABSENT'] }, 1, 0] } },
+          },
+        },
+      ]);
+
+      const pupils = await pupilsById(grouped.map((g) => g._id));
+      const rows = grouped
+        .map((g) => {
+          const pupil = pupils.get(String(g._id));
+          return {
+            admission_number: pupil?.admission_number ?? null,
+            full_name: fullName(pupil),
+            class_name: pupil?.class_id?.name ?? null,
+            section_name: pupil?.section_id?.name ?? null,
+            total: g.total,
+            present: g.present,
+            absent: g.absent,
+            percentage: g.total ? round2((100 * g.present) / g.total) : 0,
+          };
+        })
+        .sort((a, b) => a.percentage - b.percentage);
+
+      const average = rows.length
+        ? (rows.reduce((sum, r) => sum + (r.percentage || 0), 0) / rows.length).toFixed(2)
+        : 0;
       return { rows, summary: { 'Students covered': rows.length, 'Average attendance': `${average}%` } };
     },
   },
@@ -158,30 +214,32 @@ const REPORTS = {
       { key: 'result_status', label: 'Result', width: 10 },
     ],
     async run(req) {
-      const campus = campusClause(req, 'r.campus_id');
-      const scope = await studentClause(req, 'r.student_id');
-      const params = [...campus.params, ...scope.params];
-      const filters = [];
-      if (req.query.examination_id) {
-        filters.push('r.examination_id = ?');
-        params.push(req.query.examination_id);
-      }
-      if (req.query.class_id) {
-        filters.push('r.class_id = ?');
-        params.push(req.query.class_id);
-      }
-      const rows = await all(
-        `SELECT s.admission_number, (s.first_name || ' ' || COALESCE(s.last_name,'')) AS full_name,
-                c.name AS class_name, e.name AS exam_name, r.obtained_marks, r.total_marks,
-                r.percentage, r.grade, r.rank_in_class, r.result_status
-           FROM results r
-           JOIN students s ON s.id = r.student_id
-           JOIN examinations e ON e.id = r.examination_id
-           LEFT JOIN classes c ON c.id = r.class_id
-          WHERE ${campus.clause} AND ${scope.clause}${filters.length ? ' AND ' + filters.join(' AND ') : ''}
-          ORDER BY r.percentage DESC`,
-        params
-      );
+      const filter = {
+        ...campusFilter(req),
+        ...(await studentFilter(req)),
+      };
+      if (req.query.examination_id) filter.examination_id = oid(req.query.examination_id);
+      if (req.query.class_id) filter.class_id = oid(req.query.class_id);
+
+      const docs = await Result.find(filter)
+        .populate('student_id', 'admission_number first_name last_name')
+        .populate('examination_id', 'name')
+        .populate('class_id', 'name')
+        .sort({ percentage: -1 });
+
+      const rows = docs.map((r) => ({
+        admission_number: r.student_id?.admission_number ?? null,
+        full_name: fullName(r.student_id),
+        class_name: r.class_id?.name ?? null,
+        exam_name: r.examination_id?.name ?? null,
+        obtained_marks: r.obtained_marks,
+        total_marks: r.total_marks,
+        percentage: r.percentage,
+        grade: r.grade,
+        rank_in_class: r.rank_in_class,
+        result_status: r.result_status,
+      }));
+
       const passed = rows.filter((r) => r.result_status === 'PASS').length;
       return {
         rows,
@@ -211,41 +269,62 @@ const REPORTS = {
       { key: 'status', label: 'Status', width: 12 },
     ],
     async run(req) {
-      const campus = campusClause(req, 'sf.campus_id');
-      const scope = await studentClause(req, 'sf.student_id');
-      const params = [...campus.params, ...scope.params];
-      const filters = [];
-      if (req.query.status) {
-        filters.push('sf.status = ?');
-        params.push(req.query.status);
-      }
-      if (req.query.class_id) {
-        filters.push('s.class_id = ?');
-        params.push(req.query.class_id);
-      }
-      if (req.query.pending === 'true') filters.push('(sf.total_amount - sf.discount_amount - sf.paid_amount) > 0.01');
+      const filter = {
+        ...campusFilter(req),
+        ...(await studentFilter(req)),
+      };
+      if (req.query.status) filter.status = req.query.status;
 
-      const rows = await all(
-        `SELECT s.admission_number, (s.first_name || ' ' || COALESCE(s.last_name,'')) AS full_name,
-                c.name AS class_name, fs.name AS fee_name, sf.total_amount, sf.discount_amount,
-                sf.paid_amount, (sf.total_amount - sf.discount_amount - sf.paid_amount) AS balance,
-                sf.due_date, sf.status
-           FROM student_fees sf
-           JOIN students s ON s.id = sf.student_id
-           JOIN fee_structures fs ON fs.id = sf.fee_structure_id
-           LEFT JOIN classes c ON c.id = s.class_id
-          WHERE ${campus.clause} AND ${scope.clause}${filters.length ? ' AND ' + filters.join(' AND ') : ''}
-          ORDER BY sf.due_date`,
-        params
-      );
-      const sum = (key) => rows.reduce((total, row) => total + Number(row[key] || 0), 0);
+      if (req.query.class_id) {
+        const pupils = await Student.find({ class_id: oid(req.query.class_id) }).select('_id').lean();
+        filter.student_id = { $in: pupils.map((x) => x._id) };
+      }
+
+      /*
+       * "Still owing" compares three fields of the same record, which a plain
+       * filter cannot do — the 0.01 kept rounding dust from counting as a
+       * debt, and it still does.
+       */
+      if (req.query.pending === 'true') {
+        filter.$expr = {
+          $gt: [
+            { $subtract: [
+              { $subtract: [{ $ifNull: ['$total_amount', 0] }, { $ifNull: ['$discount_amount', 0] }] },
+              { $ifNull: ['$paid_amount', 0] },
+            ] },
+            0.01,
+          ],
+        };
+      }
+
+      const docs = await StudentFee.find(filter)
+        .populate('student_id', 'admission_number first_name last_name class_id')
+        .populate({ path: 'student_id', populate: { path: 'class_id', select: 'name' } })
+        .populate('fee_structure_id', 'name');
+
+      const rows = docs.map((f) => ({
+        admission_number: f.student_id?.admission_number ?? null,
+        full_name: fullName(f.student_id),
+        class_name: f.student_id?.class_id?.name ?? null,
+        fee_name: f.fee_structure_id?.name ?? null,
+        total_amount: f.total_amount,
+        discount_amount: f.discount_amount,
+        paid_amount: f.paid_amount,
+        balance: Number(f.total_amount || 0) - Number(f.discount_amount || 0) - Number(f.paid_amount || 0),
+        due_date: f.due_date,
+        status: f.status,
+      }));
+
+      const billed = rows.reduce((sum, r) => sum + Number(r.total_amount || 0), 0);
+      const collected = rows.reduce((sum, r) => sum + Number(r.paid_amount || 0), 0);
+      const outstanding = rows.reduce((sum, r) => sum + Number(r.balance || 0), 0);
       return {
         rows,
         summary: {
-          'Records': rows.length,
-          'Total billed': sum('total_amount').toFixed(2),
-          'Total collected': sum('paid_amount').toFixed(2),
-          'Outstanding': sum('balance').toFixed(2),
+          'Fee records': rows.length,
+          'Billed': billed.toFixed(2),
+          'Collected': collected.toFixed(2),
+          'Outstanding': outstanding.toFixed(2),
         },
       };
     },
@@ -264,21 +343,35 @@ const REPORTS = {
       { key: 'collected_by_name', label: 'Collected By', width: 20 },
     ],
     async run(req) {
-      const campus = campusClause(req, 'fp.campus_id');
-      const scope = await studentClause(req, 'fp.student_id');
-      const range = dateRange(req, 'fp.payment_date');
-      const rows = await all(
-        `SELECT fr.receipt_number, fp.payment_date, s.admission_number,
-                (s.first_name || ' ' || COALESCE(s.last_name,'')) AS full_name,
-                fp.amount, fp.payment_mode, u.full_name AS collected_by_name
-           FROM fee_payments fp
-           JOIN students s ON s.id = fp.student_id
-           LEFT JOIN fee_receipts fr ON fr.fee_payment_id = fp.id
-           LEFT JOIN users u ON u.id = fp.collected_by
-          WHERE ${campus.clause} AND ${scope.clause} AND ${range.clause}
-          ORDER BY fp.payment_date DESC`,
-        [...campus.params, ...scope.params, ...range.params]
-      );
+      const filter = {
+        ...campusFilter(req),
+        ...(await studentFilter(req)),
+        ...dateFilter(req, 'payment_date'),
+      };
+
+      const docs = await FeePayment.find(filter)
+        .populate('student_id', 'admission_number first_name last_name')
+        .populate('collected_by', 'full_name')
+        .sort({ payment_date: -1 });
+
+      // The receipt is a separate record pointing back at the payment, which
+      // is the direction the LEFT JOIN read it in.
+      const receipts = docs.length
+        ? await FeeReceipt.find({ fee_payment_id: { $in: docs.map((d) => d._id) } })
+          .select('fee_payment_id receipt_number').lean()
+        : [];
+      const receiptFor = new Map(receipts.map((r) => [String(r.fee_payment_id), r.receipt_number]));
+
+      const rows = docs.map((fp) => ({
+        receipt_number: receiptFor.get(String(fp._id)) ?? null,
+        payment_date: fp.payment_date,
+        admission_number: fp.student_id?.admission_number ?? null,
+        full_name: fullName(fp.student_id),
+        amount: fp.amount,
+        payment_mode: fp.payment_mode,
+        collected_by_name: fp.collected_by?.full_name ?? null,
+      }));
+
       const total = rows.reduce((sum, r) => sum + Number(r.amount || 0), 0);
       return { rows, summary: { 'Transactions': rows.length, 'Total collected': total.toFixed(2) } };
     },
@@ -299,32 +392,38 @@ const REPORTS = {
       { key: 'status', label: 'Status', width: 12 },
     ],
     async run(req) {
-      const campus = campusClause(req, 'f.campus_id');
-      const params = [...campus.params];
-      const filters = [];
-      if (req.query.staff_type) {
-        filters.push('f.staff_type = ?');
-        params.push(req.query.staff_type);
-      }
-      const rows = await all(
-        `SELECT f.faculty_code, u.full_name, f.staff_type, f.designation, d.name AS department_name,
-                f.qualification, f.date_of_joining, f.status,
-                (SELECT COUNT(*) FROM course_assignments ca WHERE ca.faculty_id = f.id AND ca.status = 'ACTIVE') AS assigned_courses
-           FROM faculty f
-           JOIN users u ON u.id = f.user_id
-           LEFT JOIN departments d ON d.id = f.department_id
-          WHERE ${campus.clause}${filters.length ? ' AND ' + filters.join(' AND ') : ''}
-          ORDER BY f.staff_type, u.full_name`,
-        params
-      );
-      return {
-        rows,
-        summary: {
-          'Total faculty': rows.length,
-          'Teaching staff': rows.filter((r) => r.staff_type === 'TEACHING').length,
-          'Financial staff': rows.filter((r) => r.staff_type === 'FINANCIAL').length,
-        },
-      };
+      const filter = campusFilter(req);
+      if (req.query.staff_type) filter.staff_type = req.query.staff_type;
+
+      const docs = await Faculty.find(filter)
+        .populate('user_id', 'full_name')
+        .populate('department_id', 'name');
+
+      // The assigned-course count was a correlated subquery: one grouped
+      // query here instead of one per member of staff.
+      const assignments = await CourseAssignment.aggregate([
+        { $match: { faculty_id: { $in: docs.map((d) => d._id) }, status: 'ACTIVE' } },
+        { $group: { _id: '$faculty_id', n: { $sum: 1 } } },
+      ]);
+      const assignedTo = new Map(assignments.map((a) => [String(a._id), a.n]));
+
+      const rows = docs
+        .map((f) => ({
+          faculty_code: f.faculty_code,
+          full_name: f.user_id?.full_name ?? fullName(f),
+          staff_type: f.staff_type,
+          designation: f.designation,
+          department_name: f.department_id?.name ?? null,
+          qualification: f.qualification,
+          date_of_joining: f.date_of_joining,
+          status: f.status,
+          assigned_courses: assignedTo.get(String(f._id)) ?? 0,
+        }))
+        .sort((a, b) =>
+          String(a.staff_type ?? '').localeCompare(String(b.staff_type ?? ''))
+          || String(a.full_name ?? '').localeCompare(String(b.full_name ?? '')));
+
+      return { rows, summary: { 'Staff': rows.length } };
     },
   },
 
@@ -342,30 +441,35 @@ const REPORTS = {
       { key: 'status', label: 'Status', width: 12 },
     ],
     async run(req) {
-      const campus = campusClause(req, 'p.campus_id');
-      const params = [...campus.params];
-      const filters = [];
-      if (req.query.month) {
-        filters.push('p.month = ?');
-        params.push(req.query.month);
-      }
-      if (req.query.year) {
-        filters.push('p.year = ?');
-        params.push(req.query.year);
-      }
+      const filter = campusFilter(req);
+      if (req.query.month) filter.month = Number(req.query.month);
+      if (req.query.year) filter.year = Number(req.query.year);
+
       // Without payroll.manage a user only ever exports their own payslips.
       if (!isAdmin(req.user) && !req.permissions.has('payroll.manage') && !req.permissions.has('payroll.edit')) {
-        filters.push('p.user_id = ?');
-        params.push(req.user.id);
+        filter.user_id = oid(req.user.id);
       }
-      const rows = await all(
-        `SELECT p.payslip_number, u.full_name, p.month, p.year, p.gross_salary, p.total_deductions,
-                p.net_salary, p.status
-           FROM payroll p JOIN users u ON u.id = p.user_id
-          WHERE ${campus.clause}${filters.length ? ' AND ' + filters.join(' AND ') : ''}
-          ORDER BY p.year DESC, p.month DESC, u.full_name`,
-        params
-      );
+
+      const docs = await Payroll.find(filter)
+        .populate('user_id', 'full_name')
+        .sort({ year: -1, month: -1 });
+
+      const rows = docs
+        .map((p2) => ({
+          payslip_number: p2.payslip_number,
+          full_name: p2.user_id?.full_name ?? null,
+          month: p2.month,
+          year: p2.year,
+          gross_salary: p2.gross_salary,
+          total_deductions: p2.total_deductions,
+          net_salary: p2.net_salary,
+          status: p2.status,
+        }))
+        // Year and month are sorted by the database; the name breaks ties
+        // within a month, which is what the third ORDER BY term did.
+        .sort((a, b) => (b.year - a.year) || (b.month - a.month)
+          || String(a.full_name ?? '').localeCompare(String(b.full_name ?? '')));
+
       const net = rows.reduce((sum, r) => sum + Number(r.net_salary || 0), 0);
       return { rows, summary: { 'Payslips': rows.length, 'Total net pay': net.toFixed(2) } };
     },
@@ -386,25 +490,49 @@ const REPORTS = {
       { key: 'maintenance_cost', label: 'Maintenance', width: 14 },
     ],
     async run(req) {
-      const campus = campusClause(req, 'r.campus_id');
-      const rows = await all(
-        `SELECT r.route_code, r.name AS route_name, v.vehicle_number, d.name AS driver_name,
-                v.capacity, r.fare,
-                (SELECT COUNT(*) FROM transport_allocations ta WHERE ta.route_id = r.id AND ta.status = 'ACTIVE') AS allocated,
-                (SELECT COALESCE(SUM(fr.total_cost),0) FROM fuel_records fr WHERE fr.vehicle_id = v.id) AS fuel_cost,
-                (SELECT COALESCE(SUM(vm.cost),0) FROM vehicle_maintenance vm WHERE vm.vehicle_id = v.id) AS maintenance_cost
-           FROM routes r
-           LEFT JOIN vehicles v ON v.id = r.vehicle_id
-           LEFT JOIN drivers d ON d.id = r.driver_id
-          WHERE ${campus.clause} ORDER BY r.name`,
-        campus.params
-      );
+      const filter = campusFilter(req);
+      const docs = await Route.find(filter)
+        .populate('vehicle_id', 'vehicle_number capacity')
+        .populate('driver_id', 'name')
+        .sort({ name: 1 });
+
+      const vehicleIds = docs.map((r) => r.vehicle_id?._id).filter(Boolean);
+      const sumBy = async (Model, field) => {
+        const rows = await Model.aggregate([
+          { $match: { vehicle_id: { $in: vehicleIds } } },
+          { $group: { _id: '$vehicle_id', n: { $sum: { $ifNull: [`$${field}`, 0] } } } },
+        ]);
+        return new Map(rows.map((r) => [String(r._id), r.n]));
+      };
+      const [allocations, fuel, maintenance] = await Promise.all([
+        TransportAllocation.aggregate([
+          { $match: { route_id: { $in: docs.map((r) => r._id) }, status: 'ACTIVE' } },
+          { $group: { _id: '$route_id', n: { $sum: 1 } } },
+        ]).then((rows) => new Map(rows.map((r) => [String(r._id), r.n]))),
+        sumBy(FuelRecord, 'total_cost'),
+        sumBy(VehicleMaintenance, 'cost'),
+      ]);
+
+      const rows = docs.map((r) => ({
+        route_code: r.route_code,
+        route_name: r.name,
+        vehicle_number: r.vehicle_id?.vehicle_number ?? null,
+        driver_name: r.driver_id?.name ?? null,
+        capacity: r.vehicle_id?.capacity ?? null,
+        fare: r.fare,
+        allocated: allocations.get(String(r._id)) ?? 0,
+        fuel_cost: fuel.get(String(r.vehicle_id?._id)) ?? 0,
+        maintenance_cost: maintenance.get(String(r.vehicle_id?._id)) ?? 0,
+      }));
+
       return {
         rows,
         summary: {
           'Routes': rows.length,
-          'Students allocated': rows.reduce((s, r) => s + Number(r.allocated || 0), 0),
-          'Running cost': rows.reduce((s, r) => s + Number(r.fuel_cost || 0) + Number(r.maintenance_cost || 0), 0).toFixed(2),
+          'Students allocated': rows.reduce((s2, r) => s2 + Number(r.allocated || 0), 0),
+          'Running cost': rows
+            .reduce((s2, r) => s2 + Number(r.fuel_cost || 0) + Number(r.maintenance_cost || 0), 0)
+            .toFixed(2),
         },
       };
     },
@@ -425,19 +553,30 @@ const REPORTS = {
       { key: 'total_value', label: 'Value', width: 12 },
     ],
     async run(req) {
-      const campus = campusClause(req, 'i.campus_id');
-      const rows = await all(
-        `SELECT i.item_code, i.name, ic.name AS category_name, i.quantity, i.unit, i.location,
-                i.condition_status, i.unit_cost, (i.quantity * i.unit_cost) AS total_value
-           FROM inventory_items i JOIN inventory_categories ic ON ic.id = i.category_id
-          WHERE ${campus.clause} ORDER BY ic.name, i.name`,
-        campus.params
-      );
+      const docs = await InventoryItem.find(campusFilter(req))
+        .populate('category_id', 'name');
+
+      const rows = docs
+        .map((i) => ({
+          item_code: i.item_code,
+          name: i.name,
+          category_name: i.category_id?.name ?? null,
+          quantity: i.quantity,
+          unit: i.unit,
+          location: i.location,
+          condition_status: i.condition_status,
+          unit_cost: i.unit_cost,
+          total_value: Number(i.quantity || 0) * Number(i.unit_cost || 0),
+        }))
+        .sort((a, b) =>
+          String(a.category_name ?? '').localeCompare(String(b.category_name ?? ''))
+          || String(a.name ?? '').localeCompare(String(b.name ?? '')));
+
       return {
         rows,
         summary: {
           'Items': rows.length,
-          'Total value': rows.reduce((s, r) => s + Number(r.total_value || 0), 0).toFixed(2),
+          'Total value': rows.reduce((s2, r) => s2 + Number(r.total_value || 0), 0).toFixed(2),
         },
       };
     },
@@ -455,12 +594,13 @@ const REPORTS = {
       { key: 'description', label: 'Description', width: 46 },
     ],
     async run(req) {
-      const range = dateRange(req, 'created_at');
-      const rows = await all(
-        `SELECT created_at, user_name, role_code, action, module, description
-           FROM activity_logs WHERE ${range.clause} ORDER BY created_at DESC LIMIT 5000`,
-        range.params
-      );
+      const rows = plain(
+        await ActivityLog.find(dateFilter(req, 'created_at'))
+          .select('created_at user_name role_code action module description')
+          .sort({ created_at: -1 })
+          .limit(5000)
+      ).map(({ id, ...row }) => row);
+
       return { rows, summary: { 'Entries': rows.length } };
     },
   },
@@ -479,37 +619,73 @@ const REPORTS = {
       { key: 'pass_count', label: 'Passed', width: 10 },
     ],
     async run(req) {
-      const campus = campusClause(req, 'm.campus_id');
-      const params = [...campus.params];
-      const filters = [];
-      if (req.query.examination_id) {
-        filters.push('m.examination_id = ?');
-        params.push(req.query.examination_id);
-      }
+      const match = { ...campusFilter(req), status: 'APPROVED' };
+      if (req.query.examination_id) match.examination_id = oid(req.query.examination_id);
+
       // A teacher only sees the courses assigned to them.
       if (isTeacher(req.user)) {
         const facultyId = await facultyIdOf(req.user);
-        filters.push(`m.course_id IN (SELECT course_id FROM course_assignments WHERE faculty_id = ? AND status = 'ACTIVE')`);
-        params.push(facultyId ?? 0);
+        const assigned = await CourseAssignment.find({ faculty_id: oid(facultyId), status: 'ACTIVE' })
+          .select('course_id').lean();
+        match.course_id = { $in: assigned.map((a) => a.course_id).filter(Boolean) };
       }
-      const rows = await all(
-        `SELECT c.name AS class_name, sec.name AS section_name, sub.name AS subject_name,
-                COUNT(m.id) AS students,
-                ROUND(AVG(m.marks_obtained), 2) AS average_marks,
-                MAX(m.marks_obtained) AS highest,
-                MIN(m.marks_obtained) AS lowest,
-                SUM(CASE WHEN m.marks_obtained >= es.pass_marks THEN 1 ELSE 0 END) AS pass_count
-           FROM marks m
-           JOIN exam_subjects es ON es.id = m.exam_subject_id
-           JOIN courses co ON co.id = m.course_id
-           JOIN subjects sub ON sub.id = co.subject_id
-           JOIN students s ON s.id = m.student_id
-           LEFT JOIN classes c ON c.id = s.class_id
-           LEFT JOIN sections sec ON sec.id = s.section_id
-          WHERE ${campus.clause} AND m.status = 'APPROVED'${filters.length ? ' AND ' + filters.join(' AND ') : ''}
-          GROUP BY co.id, sec.id, sub.id, c.id ORDER BY c.numeric_level, sec.name, sub.name`,
-        params
-      );
+
+      /*
+       * Grouped by course and by the pupil's section, which is why the pupil
+       * is brought in: the section is theirs, not the mark's. The pass count
+       * compares each mark with its own subject's pass mark, so that comes in
+       * too.
+       */
+      const grouped = await Mark.aggregate([
+        { $match: match },
+        { $lookup: { from: 'students', localField: 'student_id', foreignField: '_id', as: 'pupil' } },
+        { $unwind: '$pupil' },
+        { $lookup: { from: 'exam_subjects', localField: 'exam_subject_id', foreignField: '_id', as: 'subject' } },
+        { $unwind: '$subject' },
+        {
+          $group: {
+            _id: { course_id: '$course_id', section_id: '$pupil.section_id', class_id: '$pupil.class_id' },
+            students: { $sum: 1 },
+            average_marks: { $avg: '$marks_obtained' },
+            highest: { $max: '$marks_obtained' },
+            lowest: { $min: '$marks_obtained' },
+            pass_count: {
+              $sum: { $cond: [{ $gte: ['$marks_obtained', '$subject.pass_marks'] }, 1, 0] },
+            },
+          },
+        },
+      ]);
+
+      const courses = await Course.find({ _id: { $in: grouped.map((g) => g._id.course_id) } })
+        .select('subject_id').populate('subject_id', 'name');
+      const subjectFor = new Map(courses.map((c) => [String(c._id), c.subject_id?.name ?? null]));
+
+      const classes = await Class.find({ _id: { $in: grouped.map((g) => g._id.class_id).filter(Boolean) } })
+        .select('name numeric_level').lean();
+      const classFor = new Map(classes.map((c) => [String(c._id), c]));
+
+      const sections = await Section.find({ _id: { $in: grouped.map((g) => g._id.section_id).filter(Boolean) } })
+        .select('name').lean();
+      const sectionFor = new Map(sections.map((x) => [String(x._id), x.name]));
+
+      const rows = grouped
+        .map((g) => ({
+          class_name: classFor.get(String(g._id.class_id))?.name ?? null,
+          section_name: sectionFor.get(String(g._id.section_id)) ?? null,
+          subject_name: subjectFor.get(String(g._id.course_id)) ?? null,
+          students: g.students,
+          average_marks: round2(g.average_marks),
+          highest: g.highest,
+          lowest: g.lowest,
+          pass_count: g.pass_count,
+          _level: classFor.get(String(g._id.class_id))?.numeric_level ?? 0,
+        }))
+        .sort((a, b) =>
+          a._level - b._level
+          || String(a.section_name ?? '').localeCompare(String(b.section_name ?? ''))
+          || String(a.subject_name ?? '').localeCompare(String(b.subject_name ?? '')))
+        .map(({ _level, ...row }) => row);
+
       return { rows, summary: { 'Course groups': rows.length } };
     },
   },
@@ -554,7 +730,9 @@ router.get(
     }
 
     const { rows, summary } = await definition.run(req);
-    const campus = req.user.campus_id ? await get('SELECT name, address, city FROM campuses WHERE id = ?', [req.user.campus_id]) : null;
+    const campus = req.user.campus_id
+      ? await Campus.findById(oid(req.user.campus_id)).select('name address city').lean()
+      : null;
     const generatedAt = new Date().toISOString().replace('T', ' ').slice(0, 19);
 
     await logActivity({
