@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { all, get, run, insert, update, scalar, transaction } from '../db/connection.js';
+import { Administrator, Permission, Role, RolePermission, User, UserPermission } from '../db/mongo/models.js';
+import { oid, transaction } from '../db/mongo/connection.js';
+import { escapeRegex, insensitive, lift, plain, populateFor } from '../db/mongo/query.js';
+import { sameId } from '../lib/scope.js';
 import { asyncHandler, ok, created, pagination, paginated, safeSort } from '../lib/http.js';
 import { badRequest, notFound, conflict, forbidden } from '../lib/errors.js';
 import { requirePermission, requireRole } from '../middleware/auth.js';
@@ -43,15 +46,48 @@ const administratorSchema = z.object({
   deny_permissions: z.array(z.string()).optional(),
 });
 
-const SELECT_ADMIN = `
-  a.*, u.full_name, u.email, u.phone, u.photo, u.username, u.gender, u.status AS account_status,
-  u.last_login_at, d.name AS department_name,
-  (SELECT COUNT(*) FROM user_permissions up WHERE up.user_id = a.user_id AND up.effect = 'ALLOW') AS extra_permissions,
-  (SELECT COUNT(*) FROM user_permissions up WHERE up.user_id = a.user_id AND up.effect = 'DENY') AS revoked_permissions`;
+/** What the joins lifted from the account and the department. */
+const JOINED = {
+  user_id: {
+    full_name: 'full_name', email: 'email', phone: 'phone', photo: 'photo',
+    username: 'username', gender: 'gender', status: 'account_status',
+    last_login_at: 'last_login_at',
+  },
+  department_id: { name: 'department_name' },
+};
 
-const JOIN_ADMIN = `
-  JOIN users u ON u.id = a.user_id
-  LEFT JOIN departments d ON d.id = a.department_id`;
+/**
+ * How many permissions each of these people has been given beyond their role,
+ * and how many taken away. Two correlated subqueries; one grouped query.
+ */
+async function overrideCounts(userIds) {
+  const ids = userIds.map(oid).filter(Boolean);
+  if (!ids.length) return new Map();
+  const rows = await UserPermission.aggregate([
+    { $match: { user_id: { $in: ids } } },
+    {
+      $group: {
+        _id: '$user_id',
+        extra_permissions: { $sum: { $cond: [{ $eq: ['$effect', 'ALLOW'] }, 1, 0] } },
+        revoked_permissions: { $sum: { $cond: [{ $eq: ['$effect', 'DENY'] }, 1, 0] } },
+      },
+    },
+  ]);
+  return new Map(rows.map((r) => [String(r._id), r]));
+}
+
+/** One administrator, in the shape the joins produced. */
+async function loadAdministrator(id) {
+  const _id = oid(id);
+  if (!_id) return null;
+  const doc = await Administrator.findById(_id).populate(populateFor(JOINED));
+  if (!doc) return null;
+  const row = lift(doc, JOINED);
+  const counts = await overrideCounts([row.user_id]);
+  row.extra_permissions = counts.get(String(row.user_id))?.extra_permissions ?? 0;
+  row.revoked_permissions = counts.get(String(row.user_id))?.revoked_permissions ?? 0;
+  return row;
+}
 
 /** The next free employee code, counted from the highest in use. */
 async function nextEmployeeCode(campusId) {
@@ -59,23 +95,31 @@ async function nextEmployeeCode(campusId) {
 }
 
 /** Apply per-user permission overrides for an administrator. */
-async function applyOverrides(userId, allow = [], deny = [], grantedBy) {
-  await run('DELETE FROM user_permissions WHERE user_id = ?', [userId]);
-  for (const [effect, codes] of [
-    ['ALLOW', allow],
-    ['DENY', deny],
-  ]) {
-    for (const code of codes) {
-      const permission = await get('SELECT id FROM permissions WHERE code = ?', [code]);
-      if (!permission) continue;
-      await run('INSERT INTO user_permissions (user_id, permission_id, effect, granted_by) VALUES (?, ?, ?, ?) ON CONFLICT (user_id, permission_id) DO UPDATE SET effect = EXCLUDED.effect, granted_by = EXCLUDED.granted_by', [
-        userId,
-        permission.id,
-        effect,
-        grantedBy,
-      ]);
-    }
+async function applyOverrides(userId, allow = [], deny = [], grantedBy, session = null) {
+  const opts = session ? { session } : {};
+  await UserPermission.deleteMany({ user_id: oid(userId) }, opts);
+
+  // A code in both lists was settled by the unique key, with the last write
+  // winning — DENY is applied after ALLOW, so it still is.
+  const wanted = new Map();
+  for (const [effect, codes] of [['ALLOW', allow], ['DENY', deny]]) {
+    for (const code of codes) wanted.set(code, effect);
   }
+  if (!wanted.size) return;
+
+  const permissions = await Permission.find({ code: { $in: [...wanted.keys()] } })
+    .select('code').lean();
+  if (!permissions.length) return;
+
+  await UserPermission.insertMany(
+    permissions.map((perm) => ({
+      user_id: oid(userId),
+      permission_id: perm._id,
+      effect: wanted.get(perm.code),
+      granted_by: oid(grantedBy),
+    })),
+    { ...opts, ordered: false }
+  );
 }
 
 router.get(
@@ -85,31 +129,46 @@ router.get(
     const { page, limit, offset } = pagination(req.query);
     const { column, direction } = safeSort(req.query, ['id', 'employee_code', 'date_of_joining', 'created_at'], 'id');
 
-    const clauses = [];
-    const params = [];
-    if (!isAdmin(req.user) && req.user.campus_id) {
-      clauses.push('a.campus_id = ?');
-      params.push(req.user.campus_id);
-    }
+    const filter = {};
+    if (!isAdmin(req.user) && req.user.campus_id) filter.campus_id = oid(req.user.campus_id);
     for (const field of ['status', 'department_id']) {
       if (req.query[field] && req.query[field] !== 'ALL') {
-        clauses.push(`a.${field} = ?`);
-        params.push(req.query[field]);
+        filter[field] = field.endsWith('_id') ? oid(req.query[field]) : req.query[field];
       }
     }
-    if (req.query.search) {
-      const term = `%${req.query.search}%`;
-      clauses.push('(u.full_name ILIKE ? OR a.employee_code ILIKE ? OR u.email ILIKE ? OR a.designation ILIKE ?)');
-      params.push(term, term, term, term);
-    }
-    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
-    const total = Number(await scalar(`SELECT COUNT(*) AS n FROM administrators a JOIN users u ON u.id = a.user_id ${where}`, params));
-    const rows = await all(
-      `SELECT ${SELECT_ADMIN} FROM administrators a ${JOIN_ADMIN} ${where}
-        ORDER BY a.${column} ${direction} LIMIT ? OFFSET ?`,
-      [...params, limit, offset]
-    );
+    /*
+     * Searching matches the person's name and email, which live on their
+     * account rather than on the administrator record — the join is what let
+     * the WHERE reach them. The matching accounts are found first.
+     */
+    if (req.query.search) {
+      const term = new RegExp(escapeRegex(String(req.query.search)), 'i');
+      const accounts = await User.find({ $or: [{ full_name: term }, { email: term }] })
+        .select('_id').lean();
+      filter.$or = [
+        { employee_code: term },
+        { designation: term },
+        { user_id: { $in: accounts.map((u) => u._id) } },
+      ];
+    }
+
+    const sortField = column === 'id' ? '_id' : column;
+    const [docs, total] = await Promise.all([
+      Administrator.find(filter)
+        .populate(populateFor(JOINED))
+        .sort({ [sortField]: direction === 'ASC' ? 1 : -1, _id: 1 })
+        .skip(offset)
+        .limit(limit),
+      Administrator.countDocuments(filter),
+    ]);
+
+    const rows = lift(docs, JOINED);
+    const counts = await overrideCounts(rows.map((r) => r.user_id));
+    for (const row of rows) {
+      row.extra_permissions = counts.get(String(row.user_id))?.extra_permissions ?? 0;
+      row.revoked_permissions = counts.get(String(row.user_id))?.revoked_permissions ?? 0;
+    }
     return paginated(res, rows, total, { page, limit });
   })
 );
@@ -118,22 +177,27 @@ router.get(
   '/:id',
   requirePermission('administrators.view'),
   asyncHandler(async (req, res) => {
-    const row = await get(`SELECT ${SELECT_ADMIN} FROM administrators a ${JOIN_ADMIN} WHERE a.id = ?`, [Number(req.params.id)]);
+    const row = await loadAdministrator(req.params.id);
     if (!row) throw notFound('Administrator not found');
-    if (!isAdmin(req.user) && row.campus_id !== req.user.campus_id) throw forbidden('Different campus');
+    if (!isAdmin(req.user) && !sameId(row.campus_id, req.user.campus_id)) throw forbidden('Different campus');
 
-    const overrides = await all(
-      `SELECT p.code, p.module, p.action, up.effect
-         FROM user_permissions up JOIN permissions p ON p.id = up.permission_id
-        WHERE up.user_id = ? ORDER BY p.code`,
-      [row.user_id]
-    );
-    const rolePermissions = (await all(
-      `SELECT p.code FROM role_permissions rp
-         JOIN permissions p ON p.id = rp.permission_id
-         JOIN roles r ON r.id = rp.role_id
-        WHERE r.code = 'ADMINISTRATOR'`
-    )).map((r) => r.code);
+    const overrideDocs = await UserPermission.find({ user_id: oid(row.user_id) })
+      .populate('permission_id', 'code module action');
+    const overrides = overrideDocs
+      .filter((o) => o.permission_id)
+      .map((o) => ({
+        code: o.permission_id.code,
+        module: o.permission_id.module,
+        action: o.permission_id.action,
+        effect: o.effect,
+      }))
+      .sort((a, b) => a.code.localeCompare(b.code));
+
+    const role = await Role.findOne({ code: 'ADMINISTRATOR' }).select('_id').lean();
+    const granted = role
+      ? await RolePermission.find({ role_id: role._id }).populate('permission_id', 'code')
+      : [];
+    const rolePermissions = granted.map((rp) => rp.permission_id?.code).filter(Boolean);
 
     return ok(res, { ...row, overrides, rolePermissions });
   })
@@ -150,49 +214,53 @@ router.post(
     const campusId = body.campus_id || req.user.campus_id;
     if (!campusId) throw badRequest('Select a campus for this administrator');
 
-    const role = await get("SELECT id FROM roles WHERE code = 'ADMINISTRATOR'");
+    const role = await Role.findOne({ code: 'ADMINISTRATOR' }).select('_id').lean();
     const employeeCode = body.employee_code || await nextEmployeeCode(campusId);
     const username = body.username || employeeCode.toLowerCase();
 
-    if (await get('SELECT 1 AS x FROM users WHERE lower(username) = lower(?)', [username])) throw conflict('That username is taken');
-    if (await get('SELECT 1 AS x FROM users WHERE lower(email) = lower(?)', [body.email])) throw conflict('That email is registered');
-    if (await get('SELECT 1 AS x FROM administrators WHERE employee_code = ?', [employeeCode])) throw conflict('That employee code exists');
+    if (await User.exists({ username: insensitive(username) })) throw conflict('That username is taken');
+    if (await User.exists({ email: insensitive(body.email) })) throw conflict('That email is registered');
+    if (await Administrator.exists({ employee_code: employeeCode })) throw conflict('That employee code exists');
 
     const password = body.password || env.seedPassword;
     const passwordHash = await hashPassword(password);
 
-    const result = await transaction(async () => {
-      const userId = await insert('users', {
+    const result = await transaction(async (session) => {
+      const opts = session ? { session } : {};
+      const [account] = await User.create([{
         username,
         email: body.email,
         password_hash: passwordHash,
         full_name: body.full_name,
         phone: body.phone,
         gender: body.gender,
-        role_id: role.id,
-        campus_id: campusId,
+        role_id: role?._id,
+        campus_id: oid(campusId),
         status: body.status === 'INACTIVE' ? 'INACTIVE' : 'ACTIVE',
         must_change_password: body.password ? 0 : 1,
-        created_by: req.user.id,
-      });
-      const adminId = await insert('administrators', {
+        created_by: oid(req.user.id),
+      }], opts);
+      const userId = account._id;
+
+      const [administrator] = await Administrator.create([{
         user_id: userId,
-        campus_id: campusId,
+        campus_id: oid(campusId),
         employee_code: employeeCode,
         designation: body.designation || 'Administrator',
         board: body.board || 'BOTH',
-        department_id: body.department_id,
+        department_id: oid(body.department_id),
         date_of_joining: body.date_of_joining || new Date().toISOString().slice(0, 10),
         qualification: body.qualification,
         address: body.address,
         emergency_contact: body.emergency_contact,
         status: body.status || 'ACTIVE',
-      });
+      }], opts);
+
       if (body.allow_permissions?.length || body.deny_permissions?.length) {
-        await applyOverrides(userId, body.allow_permissions || [], body.deny_permissions || [], req.user.id);
+        await applyOverrides(userId, body.allow_permissions || [], body.deny_permissions || [], req.user.id, session);
       }
-      return { userId, adminId };
-    })();
+      return { userId: String(userId), adminId: String(administrator._id) };
+    });
 
     await logActivity({
       req,
@@ -208,7 +276,7 @@ router.post(
       },
     });
 
-    const row = await get(`SELECT ${SELECT_ADMIN} FROM administrators a ${JOIN_ADMIN} WHERE a.id = ?`, [result.adminId]);
+    const row = await loadAdministrator(result.adminId);
     return created(res, { ...row, temporaryPassword: body.password ? undefined : password });
   })
 );
@@ -219,20 +287,24 @@ router.put(
   requirePermission('administrators.edit'),
   validateBody(administratorSchema.partial()),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const existing = await get('SELECT * FROM administrators WHERE id = ?', [id]);
+    const id = req.params.id;
+    const existing = plain(await Administrator.findById(oid(id)));
     if (!existing) throw notFound('Administrator not found');
 
     const data = {};
     for (const f of ['designation', 'board', 'department_id', 'date_of_joining', 'qualification', 'address', 'emergency_contact', 'status']) {
       if (req.body[f] !== undefined) data[f] = req.body[f];
     }
-    if (Object.keys(data).length) await update('administrators', id, data);
+    if (Object.keys(data).length) {
+      await Administrator.updateOne({ _id: oid(id) }, { $set: data }, { runValidators: true });
+    }
 
     const userData = {};
     for (const f of ['full_name', 'email', 'phone', 'gender']) if (req.body[f] !== undefined) userData[f] = req.body[f];
     if (req.body.status) userData.status = req.body.status;
-    if (Object.keys(userData).length) await update('users', existing.user_id, userData);
+    if (Object.keys(userData).length) {
+      await User.updateOne({ _id: oid(existing.user_id) }, { $set: userData });
+    }
 
     const changes = diff(existing, { ...existing, ...data });
     await logActivity({
@@ -246,7 +318,7 @@ router.put(
       newValues: { ...changes.new, ...userData },
     });
 
-    return ok(res, await get(`SELECT ${SELECT_ADMIN} FROM administrators a ${JOIN_ADMIN} WHERE a.id = ?`, [id]));
+    return ok(res, await loadAdministrator(id));
   })
 );
 
@@ -262,16 +334,21 @@ router.put(
     })
   ),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const administrator = await get(`SELECT a.*, u.full_name FROM administrators a JOIN users u ON u.id = a.user_id WHERE a.id = ?`, [id]);
+    const id = req.params.id;
+    const administratorDoc = await Administrator.findById(oid(id)).populate('user_id', 'full_name');
+    const administrator = administratorDoc
+      ? lift(administratorDoc, { user_id: { full_name: 'full_name' } })
+      : null;
     if (!administrator) throw notFound('Administrator not found');
 
-    const before = await all(
-      `SELECT p.code, up.effect FROM user_permissions up JOIN permissions p ON p.id = up.permission_id WHERE up.user_id = ?`,
-      [administrator.user_id]
-    );
+    const beforeDocs = await UserPermission.find({ user_id: oid(administrator.user_id) })
+      .populate('permission_id', 'code');
+    const before = beforeDocs
+      .filter((o) => o.permission_id)
+      .map((o) => ({ code: o.permission_id.code, effect: o.effect }));
 
-    await transaction(async () => await applyOverrides(administrator.user_id, req.body.allow, req.body.deny, req.user.id))();
+    await transaction((session) =>
+      applyOverrides(administrator.user_id, req.body.allow, req.body.deny, req.user.id, session));
 
     await logActivity({
       req,
@@ -293,12 +370,24 @@ router.delete(
   requireRole(ROLES.ADMIN),
   requirePermission('administrators.delete'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const existing = await get('SELECT * FROM administrators WHERE id = ?', [id]);
+    const id = req.params.id;
+    const existing = plain(await Administrator.findById(oid(id)));
     if (!existing) throw notFound('Administrator not found');
 
-    await run('DELETE FROM administrators WHERE id = ?', [id]);
-    await run('DELETE FROM users WHERE id = ?', [existing.user_id]);
+    /*
+     * The record, the overrides attached to the account, and the account
+     * itself. ON DELETE CASCADE took the overrides with the user; nothing
+     * does that here, and an override left behind would be applied to whoever
+     * is given that id next.
+     */
+    await transaction(async (session) => {
+      const opts = session ? { session } : {};
+      await Administrator.deleteOne({ _id: oid(id) }, opts);
+      if (existing.user_id) {
+        await UserPermission.deleteMany({ user_id: oid(existing.user_id) }, opts);
+        await User.deleteOne({ _id: oid(existing.user_id) }, opts);
+      }
+    });
     await logActivity({
       req,
       action: 'DELETE',
