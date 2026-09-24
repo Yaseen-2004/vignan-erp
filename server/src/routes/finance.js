@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { all, get, run, insert, update, scalar, transaction } from '../db/connection.js';
+import { Campus, Class, Expense, Faculty, FacultyAttendance, FeePayment, FeeReceipt, FeeStructure, FuelRecord, Income, Parent, Payroll, PettyCash, SalaryStructure, Section, Student, StudentFee, StudentParent, VehicleMaintenance } from '../db/mongo/models.js';
+import { oid, transaction } from '../db/mongo/connection.js';
+import { lift, plain, startsWith } from '../db/mongo/query.js';
+import { sameId } from '../lib/scope.js';
 import { asyncHandler, ok, created } from '../lib/http.js';
 import { badRequest, notFound, forbidden } from '../lib/errors.js';
 import { requirePermission } from '../middleware/auth.js';
@@ -15,11 +18,13 @@ import { payslipNumbers, receiptNumbers } from '../lib/codes.js';
 const router = Router();
 
 /** Student-scoped WHERE fragment shared by the fee endpoints. */
-async function feeScope(req, column = 'sf.student_id') {
+async function feeScope(req, field = 'student_id') {
   const allowed = await accessibleStudentIds(req.user);
   if (allowed === null) return null;
-  if (!allowed.length) return { clause: '1 = 0', params: [] };
-  return { clause: `${column} IN (${allowed.map(() => '?').join(',')})`, params: allowed };
+  // Entitled to none means none — `$expr` because a condition on a field can
+  // be dropped, and a dropped filter over money is the whole school's.
+  if (!allowed.length) return { $expr: { $eq: [1, 0] } };
+  return { [field]: { $in: allowed.map(oid).filter(Boolean) } };
 }
 
 // ------------------------------------------------------------ fee categories
@@ -71,55 +76,66 @@ structuresRouter.post(
     })
   ),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const structure = await get('SELECT * FROM fee_structures WHERE id = ?', [id]);
+    const id = req.params.id;
+    const structure = plain(await FeeStructure.findById(oid(id)));
     if (!structure) throw notFound('Fee structure not found');
-    if (!isAdmin(req.user) && structure.campus_id !== req.user.campus_id) throw forbidden('Different campus');
+    if (!isAdmin(req.user) && !sameId(structure.campus_id, req.user.campus_id)) throw forbidden('Different campus');
 
-    const students = req.body.student_ids?.length
-      ? await all(
-          `SELECT id FROM students WHERE id IN (${req.body.student_ids.map(() => '?').join(',')}) AND status = 'ACTIVE'`,
-          req.body.student_ids
-        )
-      : await all(`SELECT id FROM students WHERE class_id = ? AND status = 'ACTIVE'`, [structure.class_id]);
+    // The pupils named, or every active pupil of the structure's class.
+    const students = plain(
+      await Student.find(
+        req.body.student_ids?.length
+          ? { _id: { $in: req.body.student_ids.map(oid).filter(Boolean) }, status: 'ACTIVE' }
+          : { class_id: oid(structure.class_id), status: 'ACTIVE' }
+      ).select('user_id')
+    );
 
     if (!students.length) throw badRequest('No active students matched this fee structure');
 
-    const assigned = await transaction(async () => {
-      let count = 0;
-      for (const student of students) {
-        const existing = await get('SELECT id FROM student_fees WHERE student_id = ? AND fee_structure_id = ?', [
-          student.id,
-          id,
-        ]);
-        if (existing) continue;
-        await insert('student_fees', {
-          campus_id: structure.campus_id,
-          student_id: student.id,
-          fee_structure_id: id,
-          academic_year_id: structure.academic_year_id,
+    // Who already has it, fetched once rather than asked per pupil.
+    const already = new Set(
+      (await StudentFee.find({
+        student_id: { $in: students.map((x) => oid(x.id)) },
+        fee_structure_id: oid(id),
+      }).select('student_id').lean()).map((f) => String(f.student_id))
+    );
+
+    const toAssign = students.filter((student) => !already.has(student.id));
+
+    const assigned = await transaction(async (session) => {
+      const opts = session ? { session } : {};
+      if (!toAssign.length) return 0;
+
+      await StudentFee.insertMany(
+        toAssign.map((student) => ({
+          campus_id: oid(structure.campus_id),
+          student_id: oid(student.id),
+          fee_structure_id: oid(id),
+          academic_year_id: oid(structure.academic_year_id),
           total_amount: structure.amount,
           discount_amount: req.body.discount_amount || 0,
           concession_reason: req.body.concession_reason,
           due_date: structure.due_date,
           status: 'PENDING',
-        });
-        count += 1;
+        })),
+        { ...opts, ordered: false }
+      );
+      return toAssign.length;
+    });
 
-        const user = await get('SELECT user_id FROM students WHERE id = ?', [student.id]);
-        if (user?.user_id) {
-          await notify({
-            userId: user.user_id,
-            campusId: structure.campus_id,
-            type: 'FEE_DUE',
-            title: `Fee assigned: ${structure.name}`,
-            body: `Amount due ${structure.amount}${structure.due_date ? ` by ${structure.due_date}` : ''}.`,
-            link: '/parent/fees',
-          });
-        }
-      }
-      return count;
-    })();
+    // Told afterwards, outside the transaction: a notification that fails
+    // must not undo a fee that was properly assigned.
+    for (const student of toAssign) {
+      if (!student.user_id) continue;
+      await notify({
+        userId: String(student.user_id),
+        campusId: structure.campus_id,
+        type: 'FEE_DUE',
+        title: `Fee assigned: ${structure.name}`,
+        body: `Amount due ${structure.amount}${structure.due_date ? ` by ${structure.due_date}` : ''}.`,
+        link: '/parent/fees',
+      });
+    }
 
     await logActivity({
       req,
@@ -179,71 +195,145 @@ router.post(
   ),
   asyncHandler(async (req, res) => {
     const body = req.body;
-    const studentFee = await get(
-      `SELECT sf.*, s.first_name, s.last_name, s.admission_number, s.user_id AS student_user_id,
-              fs.name AS fee_name
-         FROM student_fees sf
-         JOIN students s ON s.id = sf.student_id
-         JOIN fee_structures fs ON fs.id = sf.fee_structure_id
-        WHERE sf.id = ?`,
-      [body.student_fee_id]
-    );
-    if (!studentFee) throw notFound('Fee record not found');
-    if (!isAdmin(req.user) && studentFee.campus_id !== req.user.campus_id) throw forbidden('Different campus');
+    const feeDoc = await StudentFee.findById(oid(body.student_fee_id))
+      .populate('student_id', 'first_name last_name admission_number user_id')
+      .populate('fee_structure_id', 'name');
+    if (!feeDoc) throw notFound('Fee record not found');
+
+    const studentFee = {
+      ...lift(feeDoc, {
+        student_id: {
+          first_name: 'first_name', last_name: 'last_name',
+          admission_number: 'admission_number', user_id: 'student_user_id',
+        },
+        fee_structure_id: { name: 'fee_name' },
+      }),
+    };
+    if (!isAdmin(req.user) && !sameId(studentFee.campus_id, req.user.campus_id)) throw forbidden('Different campus');
 
     const payable = studentFee.total_amount - studentFee.discount_amount - studentFee.paid_amount;
     if (payable <= 0) throw badRequest('This fee has already been settled');
     if (body.amount > payable + 0.01) throw badRequest(`The outstanding balance is only ${payable.toFixed(2)}`);
 
-    const result = await transaction(async () => {
-      const paymentId = await insert('fee_payments', {
-        campus_id: studentFee.campus_id,
-        student_fee_id: studentFee.id,
-        student_id: studentFee.student_id,
+    const paymentDate = body.payment_date || new Date().toISOString().slice(0, 10);
+
+    const result = await transaction(async (session) => {
+      const opts = session ? { session } : {};
+
+      /*
+       * The balance is adjusted by the database, not written from a figure
+       * read a moment ago.
+       *
+       * Two cashiers taking payments from the same family at the same counter
+       * would both have read the same paid_amount and both written their own
+       * total, and one family's money would simply not be there — the fee
+       * would show as partly paid when it had been paid twice over. `$inc`
+       * cannot lose a payment that way.
+       *
+       * The condition rides in the filter for the same reason: it is checked
+       * at the moment of the write, so a payment that would overshoot the
+       * balance because another was taken in between does not apply at all.
+       */
+      const applied = await StudentFee.updateOne(
+        {
+          _id: oid(studentFee.id),
+          $expr: {
+            $lte: [
+              body.amount,
+              {
+                $add: [
+                  { $subtract: [
+                    { $subtract: [{ $ifNull: ['$total_amount', 0] }, { $ifNull: ['$discount_amount', 0] }] },
+                    { $ifNull: ['$paid_amount', 0] },
+                  ] },
+                  0.01,
+                ],
+              },
+            ],
+          },
+        },
+        [
+          { $set: { paid_amount: { $add: [{ $ifNull: ['$paid_amount', 0] }, body.amount] } } },
+          {
+            $set: {
+              status: {
+                $cond: [
+                  {
+                    $lte: [
+                      { $subtract: [
+                        { $subtract: [{ $ifNull: ['$total_amount', 0] }, { $ifNull: ['$discount_amount', 0] }] },
+                        { $ifNull: ['$paid_amount', 0] },
+                      ] },
+                      0.01,
+                    ],
+                  },
+                  'PAID',
+                  'PARTIAL',
+                ],
+              },
+            },
+          },
+        ],
+        opts
+      );
+
+      // Nothing changed means another payment got there first and this one
+      // would now exceed the balance. Better refused than taken twice.
+      if (!applied.modifiedCount) {
+        throw badRequest('That payment no longer fits the outstanding balance. Reload and try again.');
+      }
+
+      const [payment] = await FeePayment.create([{
+        campus_id: oid(studentFee.campus_id),
+        student_fee_id: oid(studentFee.id),
+        student_id: oid(studentFee.student_id),
         amount: body.amount,
-        payment_date: body.payment_date || new Date().toISOString().slice(0, 10),
+        payment_date: paymentDate,
         payment_mode: body.payment_mode,
         transaction_ref: body.transaction_ref,
         bank_name: body.bank_name,
         remarks: body.remarks,
         status: 'SUCCESS',
-        collected_by: req.user.id,
-      });
+        collected_by: oid(req.user.id),
+      }], opts);
 
-      const paid = studentFee.paid_amount + body.amount;
-      const balance = studentFee.total_amount - studentFee.discount_amount - paid;
-      await update('student_fees', studentFee.id, {
-        paid_amount: paid,
-        status: balance <= 0.01 ? 'PAID' : 'PARTIAL',
-      });
+      // Read back for the balance actually left, rather than the one worked
+      // out from what was read before the write.
+      const after = await StudentFee.findById(oid(studentFee.id)).select('total_amount discount_amount paid_amount').lean();
+      const balance = Number(after.total_amount || 0) - Number(after.discount_amount || 0) - Number(after.paid_amount || 0);
 
       const year = new Date().getFullYear();
       const receiptNumber = (await receiptNumbers(studentFee.campus_id, year)).take();
 
-      const receiptId = await insert('fee_receipts', {
-        campus_id: studentFee.campus_id,
-        fee_payment_id: paymentId,
-        student_id: studentFee.student_id,
+      const [receipt] = await FeeReceipt.create([{
+        campus_id: oid(studentFee.campus_id),
+        fee_payment_id: payment._id,
+        student_id: oid(studentFee.student_id),
         receipt_number: receiptNumber,
         amount: body.amount,
         amount_in_words: amountInWords(body.amount),
-        issued_by: req.user.id,
-      });
+        issued_by: oid(req.user.id),
+      }], opts);
 
       // Fee income also lands in the income ledger.
-      await insert('income', {
-        campus_id: studentFee.campus_id,
+      await Income.create([{
+        campus_id: oid(studentFee.campus_id),
         category: 'FEES',
         title: `${studentFee.fee_name} — ${studentFee.admission_number}`,
         amount: body.amount,
-        income_date: body.payment_date || new Date().toISOString().slice(0, 10),
+        income_date: paymentDate,
         payment_mode: body.payment_mode,
         reference: receiptNumber,
-        recorded_by: req.user.id,
-      });
+        recorded_by: oid(req.user.id),
+      }], opts);
 
-      return { paymentId, receiptId, receiptNumber, balance };
-    })();
+      return {
+        paymentId: String(payment._id),
+        receiptId: String(receipt._id),
+        receiptNumber,
+        balance,
+      };
+    });
 
     if (studentFee.student_user_id) {
       await notify({
@@ -255,11 +345,15 @@ router.post(
         link: '/parent/fees',
       });
     }
-    const parents = await all(
-      `SELECT p.user_id FROM student_parents sp JOIN parents p ON p.id = sp.parent_id
-        WHERE sp.student_id = ? AND p.user_id IS NOT NULL`,
-      [studentFee.student_id]
-    );
+    // Every family linked to this pupil, with a sign-in of their own.
+    const links = await StudentParent.find({ student_id: oid(studentFee.student_id) })
+      .select('parent_id').lean();
+    const parents = links.length
+      ? plain(
+        await Parent.find({ _id: { $in: links.map((l) => l.parent_id) }, user_id: { $ne: null } })
+          .select('user_id campus_id')
+      )
+      : [];
     for (const parent of parents) {
       await notify({
         userId: parent.user_id,
@@ -321,32 +415,56 @@ router.get(
   '/receipts/:id',
   requirePermission('payments.view', 'fees.view'),
   asyncHandler(async (req, res) => {
-    const receipt = await get(
-      `SELECT fr.*, fp.amount AS payment_amount, fp.payment_mode, fp.payment_date, fp.transaction_ref,
-              s.first_name, s.last_name, s.admission_number, s.roll_number,
-              c.name AS class_name, sec.name AS section_name,
-              fs.name AS fee_name, fc.name AS category_name,
-              u.full_name AS issued_by_name,
-              sf.total_amount, sf.discount_amount, sf.paid_amount,
-              (sf.total_amount - sf.discount_amount - sf.paid_amount) AS balance
-         FROM fee_receipts fr
-         JOIN fee_payments fp ON fp.id = fr.fee_payment_id
-         JOIN student_fees sf ON sf.id = fp.student_fee_id
-         JOIN fee_structures fs ON fs.id = sf.fee_structure_id
-         JOIN fee_categories fc ON fc.id = fs.fee_category_id
-         JOIN students s ON s.id = fr.student_id
-         LEFT JOIN classes c ON c.id = s.class_id
-         LEFT JOIN sections sec ON sec.id = s.section_id
-         LEFT JOIN users u ON u.id = fr.issued_by
-        WHERE fr.id = ?`,
-      [Number(req.params.id)]
-    );
+    const receiptDoc = await FeeReceipt.findById(oid(req.params.id))
+      .populate('student_id', 'first_name last_name admission_number roll_number class_id section_id')
+      .populate({
+        path: 'fee_payment_id',
+        select: 'amount payment_mode payment_date transaction_ref student_fee_id',
+        populate: {
+          path: 'student_fee_id',
+          select: 'total_amount discount_amount paid_amount fee_structure_id',
+          populate: { path: 'fee_structure_id', select: 'name fee_category_id', populate: { path: 'fee_category_id', select: 'name' } },
+        },
+      })
+      .populate('issued_by', 'full_name');
+    if (!receiptDoc) throw notFound('Receipt not found');
+
+    const studentFeeOnReceipt = receiptDoc.fee_payment_id?.student_fee_id;
+    const pupil = receiptDoc.student_id;
+    const [klass, section] = await Promise.all([
+      pupil?.class_id ? Class.findById(pupil.class_id).select('name').lean() : null,
+      pupil?.section_id ? Section.findById(pupil.section_id).select('name').lean() : null,
+    ]);
+
+    const receipt = {
+      ...plain(receiptDoc),
+      payment_amount: receiptDoc.fee_payment_id?.amount ?? null,
+      payment_mode: receiptDoc.fee_payment_id?.payment_mode ?? null,
+      payment_date: receiptDoc.fee_payment_id?.payment_date ?? null,
+      transaction_ref: receiptDoc.fee_payment_id?.transaction_ref ?? null,
+      first_name: pupil?.first_name ?? null,
+      last_name: pupil?.last_name ?? null,
+      admission_number: pupil?.admission_number ?? null,
+      roll_number: pupil?.roll_number ?? null,
+      class_name: klass?.name ?? null,
+      section_name: section?.name ?? null,
+      fee_name: studentFeeOnReceipt?.fee_structure_id?.name ?? null,
+      category_name: studentFeeOnReceipt?.fee_structure_id?.fee_category_id?.name ?? null,
+      issued_by_name: receiptDoc.issued_by?.full_name ?? null,
+      total_amount: studentFeeOnReceipt?.total_amount ?? null,
+      discount_amount: studentFeeOnReceipt?.discount_amount ?? null,
+      paid_amount: studentFeeOnReceipt?.paid_amount ?? null,
+      balance: studentFeeOnReceipt
+        ? Number(studentFeeOnReceipt.total_amount || 0)
+          - Number(studentFeeOnReceipt.discount_amount || 0)
+          - Number(studentFeeOnReceipt.paid_amount || 0)
+        : null,
+    };
     if (!receipt) throw notFound('Receipt not found');
     await assertStudentAccess(req.user, receipt.student_id);
 
-    const campus = await get('SELECT name, address, city, state, pincode, phone, email, logo FROM campuses WHERE id = ?', [
-      receipt.campus_id,
-    ]);
+    const campus = await Campus.findById(oid(receipt.campus_id))
+      .select('name address city state pincode phone email logo').lean();
     return ok(res, { receipt, campus });
   })
 );
@@ -355,29 +473,23 @@ router.get(
   '/receipts',
   requirePermission('payments.view', 'fees.view'),
   asyncHandler(async (req, res) => {
-    const scope = await feeScope(req, 'fr.student_id');
-    const clauses = [];
-    const params = [];
-    if (!isAdmin(req.user) && req.user.campus_id) {
-      clauses.push('fr.campus_id = ?');
-      params.push(req.user.campus_id);
-    }
-    if (scope) {
-      clauses.push(scope.clause);
-      params.push(...scope.params);
-    }
-    if (req.query.student_id) {
-      clauses.push('fr.student_id = ?');
-      params.push(req.query.student_id);
-    }
-    const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
-    const rows = await all(
-      `SELECT fr.*, s.first_name, s.last_name, s.admission_number, fp.payment_mode, fp.payment_date
-         FROM fee_receipts fr
-         JOIN students s ON s.id = fr.student_id
-         JOIN fee_payments fp ON fp.id = fr.fee_payment_id
-         ${where} ORDER BY fr.issued_at DESC LIMIT 200`,
-      params
+    const filter = {};
+    if (!isAdmin(req.user) && req.user.campus_id) filter.campus_id = oid(req.user.campus_id);
+    Object.assign(filter, (await feeScope(req)) || {});
+    if (req.query.student_id) filter.student_id = oid(req.query.student_id);
+
+    const rows = lift(
+      await FeeReceipt.find(filter)
+        .populate('student_id', 'first_name last_name admission_number')
+        .populate('fee_payment_id', 'payment_mode payment_date')
+        .sort({ issued_at: -1 })
+        .limit(200),
+      {
+        student_id: {
+          first_name: 'first_name', last_name: 'last_name', admission_number: 'admission_number',
+        },
+        fee_payment_id: { payment_mode: 'payment_mode', payment_date: 'payment_date' },
+      }
     );
     return ok(res, rows);
   })
@@ -388,38 +500,58 @@ router.get(
   '/pending',
   requirePermission('fees.view'),
   asyncHandler(async (req, res) => {
-    const clauses = ['(sf.total_amount - sf.discount_amount - sf.paid_amount) > 0.01'];
-    const params = [];
-    if (!isAdmin(req.user) && req.user.campus_id) {
-      clauses.push('sf.campus_id = ?');
-      params.push(req.user.campus_id);
-    }
-    const scope = await feeScope(req);
-    if (scope) {
-      clauses.push(scope.clause);
-      params.push(...scope.params);
-    }
-    if (req.query.class_id) {
-      clauses.push('s.class_id = ?');
-      params.push(req.query.class_id);
-    }
-    if (req.query.overdue === 'true') clauses.push("substr(sf.due_date, 1, 10) < to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD')");
+    /*
+     * Still owing: a comparison between three fields of the same record, which
+     * a plain filter cannot make. The 0.01 keeps rounding dust from being
+     * reported to a parent as a debt.
+     */
+    const owing = {
+      $expr: {
+        $gt: [
+          { $subtract: [
+            { $subtract: [{ $ifNull: ['$total_amount', 0] }, { $ifNull: ['$discount_amount', 0] }] },
+            { $ifNull: ['$paid_amount', 0] },
+          ] },
+          0.01,
+        ],
+      },
+    };
 
-    const rows = await all(
-      `SELECT sf.id, sf.student_id, sf.total_amount, sf.discount_amount, sf.paid_amount, sf.due_date, sf.status,
-              (sf.total_amount - sf.discount_amount - sf.paid_amount) AS balance,
-              s.first_name, s.last_name, s.admission_number, s.roll_number, s.phone,
-              c.name AS class_name, sec.name AS section_name, fs.name AS fee_name,
-              CASE WHEN substr(sf.due_date, 1, 10) < to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD') THEN 1 ELSE 0 END AS is_overdue
-         FROM student_fees sf
-         JOIN students s ON s.id = sf.student_id
-         JOIN fee_structures fs ON fs.id = sf.fee_structure_id
-         LEFT JOIN classes c ON c.id = s.class_id
-         LEFT JOIN sections sec ON sec.id = s.section_id
-        WHERE ${clauses.join(' AND ')}
-        ORDER BY sf.due_date LIMIT 500`,
-      params
-    );
+    const filter = { ...owing };
+    if (!isAdmin(req.user) && req.user.campus_id) filter.campus_id = oid(req.user.campus_id);
+    Object.assign(filter, (await feeScope(req)) || {});
+
+    // The class belongs to the pupil, not the fee — the join reached it.
+    if (req.query.class_id) {
+      const pupils = await Student.find({ class_id: oid(req.query.class_id) }).select('_id').lean();
+      filter.student_id = { $in: pupils.map((x) => x._id) };
+    }
+
+    const today = new Date().toISOString().slice(0, 10);
+    if (req.query.overdue === 'true') filter.due_date = { $ne: null, $lt: today };
+
+    const rows = lift(
+      await StudentFee.find(filter)
+        .select('student_id total_amount discount_amount paid_amount due_date status fee_structure_id')
+        .populate('student_id', 'first_name last_name admission_number roll_number phone class_id section_id')
+        .populate('fee_structure_id', 'name')
+        .sort({ due_date: 1 })
+        .limit(500),
+      {
+        student_id: {
+          first_name: 'first_name', last_name: 'last_name', admission_number: 'admission_number',
+          roll_number: 'roll_number', phone: 'phone',
+        },
+        'student_id.class_id': { name: 'class_name' },
+        'student_id.section_id': { name: 'section_name' },
+        fee_structure_id: { name: 'fee_name' },
+      }
+    ).map((row) => ({
+      ...row,
+      balance: Number(row.total_amount || 0) - Number(row.discount_amount || 0) - Number(row.paid_amount || 0),
+      // What the CASE produced: past its date, and something still owing.
+      is_overdue: row.due_date && String(row.due_date).slice(0, 10) < today ? 1 : 0,
+    }));
 
     const totals = rows.reduce(
       (acc, row) => ({
@@ -439,70 +571,96 @@ router.get(
   requirePermission('fees.view', 'finance.view'),
   asyncHandler(async (req, res) => {
     const campusId = req.user.campus_id;
-    const scope = isAdmin(req.user) && !campusId ? '' : ' AND campus_id = ?';
-    const p = scope ? [campusId] : [];
+    const scope = isAdmin(req.user) && !campusId ? {} : { campus_id: oid(campusId) };
 
-    const today = Number(await scalar(`SELECT COALESCE(SUM(amount), 0) AS n FROM fee_payments WHERE payment_date = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD')${scope}`, p));
-    const month = Number(
-      await scalar(
-        `SELECT COALESCE(SUM(amount), 0) AS n FROM fee_payments
-          WHERE substr(payment_date, 1, 7) = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM')${scope}`,
-        p
-      )
-    );
-    const year = Number(
-      await scalar(
-        `SELECT COALESCE(SUM(amount), 0) AS n FROM fee_payments
-          WHERE substr(payment_date, 1, 4) = to_char((now() AT TIME ZONE 'UTC'), 'YYYY')${scope}`,
-        p
-      )
-    );
-    const pending = await get(
-      `SELECT COUNT(*) AS count, COALESCE(SUM(total_amount - discount_amount - paid_amount), 0) AS amount
-         FROM student_fees WHERE (total_amount - discount_amount - paid_amount) > 0.01${scope}`,
-      p
-    );
-    const income = Number(
-      await scalar(`SELECT COALESCE(SUM(amount), 0) AS n FROM income WHERE substr(income_date, 1, 4) = to_char((now() AT TIME ZONE 'UTC'), 'YYYY')${scope}`, p)
-    );
-    const expenses = Number(
-      await scalar(`SELECT COALESCE(SUM(amount), 0) AS n FROM expenses WHERE substr(expense_date, 1, 4) = to_char((now() AT TIME ZONE 'UTC'), 'YYYY') AND status = 'APPROVED'${scope}`, p)
-    );
-    const payrollMonth = Number(
-      await scalar(`SELECT COALESCE(SUM(net_salary), 0) AS n FROM payroll WHERE month = CAST(to_char((now() AT TIME ZONE 'UTC'), 'MM') AS INTEGER) AND year = CAST(to_char((now() AT TIME ZONE 'UTC'), 'YYYY') AS INTEGER)${scope}`, p)
-    );
-    const transportExpense = Number(
-      await scalar(
-        `SELECT COALESCE((SELECT SUM(total_cost) FROM fuel_records WHERE substr(fuel_date, 1, 4) = to_char((now() AT TIME ZONE 'UTC'), 'YYYY')${scope}), 0)
-              + COALESCE((SELECT SUM(cost) FROM vehicle_maintenance WHERE substr(service_date, 1, 4) = to_char((now() AT TIME ZONE 'UTC'), 'YYYY')${scope}), 0) AS n`,
-        scope ? [campusId, campusId] : []
-      )
-    );
+    const now = new Date();
+    const thisDay = now.toISOString().slice(0, 10);
+    const thisMonth = thisDay.slice(0, 7);
+    const thisYear = thisDay.slice(0, 4);
 
-    const monthlyTrend = (await all(
-      `SELECT substr(payment_date, 1, 7) AS month, SUM(amount) AS collected
-         FROM fee_payments WHERE 1 = 1${scope}
-        GROUP BY month ORDER BY month DESC LIMIT 12`,
-      p
-    )).reverse();
+    /** COALESCE(SUM(x), 0) over one collection. */
+    const sumOf = async (Model, match, field = 'amount') => {
+      const [row] = await Model.aggregate([
+        { $match: { ...scope, ...match } },
+        { $group: { _id: null, n: { $sum: { $ifNull: [`$${field}`, 0] } } } },
+      ]);
+      return row?.n ?? 0;
+    };
 
-    const recent = await all(
-      `SELECT fp.id, fp.amount, fp.payment_date, fp.payment_mode, s.first_name, s.last_name,
-              s.admission_number, fr.receipt_number
-         FROM fee_payments fp
-         JOIN students s ON s.id = fp.student_id
-         LEFT JOIN fee_receipts fr ON fr.fee_payment_id = fp.id
-        WHERE 1 = 1${scope ? ' AND fp.campus_id = ?' : ''}
-        ORDER BY fp.created_at DESC LIMIT 10`,
-      p
-    );
+    const [today, month, year, income, expenses, payrollMonth, fuel, maintenance] = await Promise.all([
+      sumOf(FeePayment, { payment_date: thisDay }),
+      sumOf(FeePayment, { payment_date: startsWith(thisMonth) }),
+      sumOf(FeePayment, { payment_date: startsWith(thisYear) }),
+      sumOf(Income, { income_date: startsWith(thisYear) }),
+      sumOf(Expense, { expense_date: startsWith(thisYear), status: 'APPROVED' }),
+      sumOf(Payroll, { month: now.getMonth() + 1, year: Number(thisYear) }, 'net_salary'),
+      sumOf(FuelRecord, { fuel_date: startsWith(thisYear) }, 'total_cost'),
+      sumOf(VehicleMaintenance, { service_date: startsWith(thisYear) }, 'cost'),
+    ]);
+    const transportExpense = fuel + maintenance;
 
-    const byMode = await all(
-      `SELECT payment_mode, COUNT(*) AS count, SUM(amount) AS amount FROM fee_payments
-        WHERE substr(payment_date, 1, 7) = to_char((now() AT TIME ZONE 'UTC'), 'YYYY-MM')${scope}
-        GROUP BY payment_mode`,
-      p
+    // Everything still owed, counted and totalled together.
+    const [pendingRow] = await StudentFee.aggregate([
+      {
+        $match: {
+          ...scope,
+          $expr: {
+            $gt: [
+              { $subtract: [
+                { $subtract: [{ $ifNull: ['$total_amount', 0] }, { $ifNull: ['$discount_amount', 0] }] },
+                { $ifNull: ['$paid_amount', 0] },
+              ] },
+              0.01,
+            ],
+          },
+        },
+      },
+      {
+        $group: {
+          _id: null,
+          count: { $sum: 1 },
+          amount: {
+            $sum: {
+              $subtract: [
+                { $subtract: [{ $ifNull: ['$total_amount', 0] }, { $ifNull: ['$discount_amount', 0] }] },
+                { $ifNull: ['$paid_amount', 0] },
+              ],
+            },
+          },
+        },
+      },
+    ]);
+    const pending = pendingRow || { count: 0, amount: 0 };
+
+    // Twelve months, oldest first — sorted descending, limited, then reversed,
+    // so it is the twelve most recent rather than the first twelve on record.
+    const monthlyTrend = (await FeePayment.aggregate([
+      { $match: scope },
+      { $group: { _id: { $substrBytes: ['$payment_date', 0, 7] }, collected: { $sum: { $ifNull: ['$amount', 0] } } } },
+      { $sort: { _id: -1 } },
+      { $limit: 12 },
+    ])).map((m) => ({ month: m._id, collected: m.collected })).reverse();
+
+    const recentDocs = await FeePayment.find(scope)
+      .select('amount payment_date payment_mode student_id')
+      .populate('student_id', 'first_name last_name admission_number')
+      .sort({ created_at: -1 })
+      .limit(10);
+    const receiptsFor = new Map(
+      (await FeeReceipt.find({ fee_payment_id: { $in: recentDocs.map((x) => x._id) } })
+        .select('fee_payment_id receipt_number').lean())
+        .map((r) => [String(r.fee_payment_id), r.receipt_number])
     );
+    const recent = lift(recentDocs, {
+      student_id: {
+        first_name: 'first_name', last_name: 'last_name', admission_number: 'admission_number',
+      },
+    }).map((row) => ({ ...row, receipt_number: receiptsFor.get(row.id) ?? null }));
+
+    const byMode = (await FeePayment.aggregate([
+      { $match: { ...scope, payment_date: startsWith(thisMonth) } },
+      { $group: { _id: '$payment_mode', count: { $sum: 1 }, amount: { $sum: { $ifNull: ['$amount', 0] } } } },
+    ])).map((m) => ({ payment_mode: m._id, count: m.count, amount: m.amount }));
 
     return ok(res, {
       collection: { today, month, year },
@@ -571,10 +729,8 @@ router.use(
     required: ['entry_type', 'amount', 'purpose'],
     defaultSort: 'entry_date',
     beforeCreate: async (data, req) => {
-      const last = await get(
-        `SELECT balance_after FROM petty_cash WHERE campus_id = ? ORDER BY id DESC LIMIT 1`,
-        [req.user.campus_id]
-      );
+      const last = await PettyCash.findOne({ campus_id: oid(req.user.campus_id) })
+        .sort({ _id: -1 }).select('balance_after').lean();
       const previous = last?.balance_after ?? 0;
       const delta = data.entry_type === 'IN' ? Number(data.amount) : -Number(data.amount);
       return { ...data, handled_by: req.user.id, balance_after: previous + delta };
@@ -647,14 +803,13 @@ payrollRouter.post(
     const { month, year } = req.body;
     const campusId = req.user.campus_id;
 
-    const structures = req.body.user_ids?.length
-      ? await all(
-          `SELECT * FROM salary_structures WHERE status = 'ACTIVE' AND user_id IN (${req.body.user_ids
-            .map(() => '?')
-            .join(',')})`,
-          req.body.user_ids
-        )
-      : await all(`SELECT * FROM salary_structures WHERE status = 'ACTIVE'${campusId ? ' AND campus_id = ?' : ''}`, campusId ? [campusId] : []);
+    const structures = plain(
+      await SalaryStructure.find(
+        req.body.user_ids?.length
+          ? { status: 'ACTIVE', user_id: { $in: req.body.user_ids.map(oid).filter(Boolean) } }
+          : { status: 'ACTIVE', ...(campusId ? { campus_id: oid(campusId) } : {}) }
+      )
+    );
 
     if (!structures.length) throw badRequest('No active salary structures were found');
 
@@ -663,32 +818,54 @@ payrollRouter.post(
     // Built once for the whole run rather than per payslip.
     const payslips = await payslipNumbers(year, month);
 
-    const summary = await transaction(async () => {
+    /*
+     * Everything the run needs, fetched once for everybody rather than three
+     * queries per payslip. A school of two hundred staff was six hundred round
+     * trips inside one transaction.
+     */
+    const userIds = structures.map((x) => oid(x.user_id)).filter(Boolean);
+
+    const alreadyPaid = new Set(
+      (await Payroll.find({ user_id: { $in: userIds }, month, year }).select('user_id').lean())
+        .map((r) => String(r.user_id))
+    );
+
+    const staff = await Faculty.find({ user_id: { $in: userIds } }).select('user_id').lean();
+    const facultyFor = new Map(staff.map((f) => [String(f.user_id), f._id]));
+
+    /*
+     * Days present and absent in this month. The dates are text, so the month
+     * is matched by its prefix — `2026-09` — which is what the two substr()
+     * casts were doing, without converting anything.
+     */
+    const monthPrefix = `${year}-${String(month).padStart(2, '0')}`;
+    const attendanceRows = await FacultyAttendance.aggregate([
+      { $match: { faculty_id: { $in: [...facultyFor.values()] }, attendance_date: startsWith(monthPrefix) } },
+      {
+        $group: {
+          _id: '$faculty_id',
+          total: { $sum: 1 },
+          present: { $sum: { $cond: [{ $in: ['$status', ['PRESENT', 'LATE']] }, 1, 0] } },
+          absent: { $sum: { $cond: [{ $eq: ['$status', 'ABSENT'] }, 1, 0] } },
+        },
+      },
+    ]);
+    const attendanceFor = new Map(attendanceRows.map((a) => [String(a._id), a]));
+
+    const summary = await transaction(async (session) => {
+      const opts = session ? { session } : {};
       let generated = 0;
       let skipped = 0;
+      const payslipsToWrite = [];
+
       for (const structure of structures) {
-        const existing = await get('SELECT id FROM payroll WHERE user_id = ? AND month = ? AND year = ?', [
-          structure.user_id,
-          month,
-          year,
-        ]);
-        if (existing) {
+        if (alreadyPaid.has(String(structure.user_id))) {
           skipped += 1;
           continue;
         }
 
-        const faculty = await get('SELECT id FROM faculty WHERE user_id = ?', [structure.user_id]);
-        const attendance = faculty
-          ? await get(
-              `SELECT COUNT(*) AS total,
-                      SUM(CASE WHEN status IN ('PRESENT','LATE') THEN 1 ELSE 0 END) AS present,
-                      SUM(CASE WHEN status = 'ABSENT' THEN 1 ELSE 0 END) AS absent
-                 FROM faculty_attendance
-                WHERE faculty_id = ? AND CAST(substr(attendance_date, 6, 2) AS INTEGER) = ?
-                  AND CAST(substr(attendance_date, 1, 4) AS INTEGER) = ?`,
-              [faculty.id, month, year]
-            )
-          : null;
+        const facultyId = facultyFor.get(String(structure.user_id));
+        const attendance = facultyId ? attendanceFor.get(String(facultyId)) : null;
 
         const allowances =
           structure.hra + structure.da + structure.conveyance + structure.medical + structure.other_allowances;
@@ -698,9 +875,9 @@ payrollRouter.post(
         const deductions = structure.pf_deduction + structure.tax_deduction + structure.other_deductions + lopAmount;
         const gross = structure.basic_salary + allowances;
 
-        await insert('payroll', {
-          campus_id: structure.campus_id,
-          user_id: structure.user_id,
+        payslipsToWrite.push({
+          campus_id: oid(structure.campus_id),
+          user_id: oid(structure.user_id),
           month,
           year,
           basic_salary: structure.basic_salary,
@@ -713,12 +890,16 @@ payrollRouter.post(
           net_salary: Number((gross - deductions).toFixed(2)),
           payslip_number: payslips.take(),
           status: 'PROCESSED',
-          processed_by: req.user.id,
+          processed_by: oid(req.user.id),
         });
         generated += 1;
       }
+
+      if (payslipsToWrite.length) {
+        await Payroll.insertMany(payslipsToWrite, { ...opts, ordered: false });
+      }
       return { generated, skipped };
-    })();
+    });
 
     await logActivity({
       req,
@@ -744,29 +925,39 @@ payrollRouter.post(
     })
   ),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const record = await get('SELECT * FROM payroll WHERE id = ?', [id]);
+    const id = req.params.id;
+    const record = plain(await Payroll.findById(oid(id)));
     if (!record) throw notFound('Payroll record not found');
     if (record.status === 'PAID') throw badRequest('This payslip is already marked paid');
 
-    await update('payroll', id, {
-      status: 'PAID',
-      payment_date: req.body.payment_date || new Date().toISOString().slice(0, 10),
-      payment_mode: req.body.payment_mode,
-      remarks: req.body.remarks,
-    });
+    /*
+     * Marking it paid and recording the expense are one act. A payslip marked
+     * paid with no expense behind it is money the school cannot account for,
+     * exactly as with a settled fine.
+     */
+    await transaction(async (session) => {
+      const opts = session ? { session } : {};
+      await Payroll.updateOne({ _id: oid(id) }, {
+        $set: {
+          status: 'PAID',
+          payment_date: req.body.payment_date || new Date().toISOString().slice(0, 10),
+          payment_mode: req.body.payment_mode,
+          remarks: req.body.remarks,
+        },
+      }, opts);
 
-    // Salary paid is an institutional expense.
-    await insert('expenses', {
-      campus_id: record.campus_id,
-      category: 'PAYROLL',
-      title: `Salary ${record.month}/${record.year} — ${record.payslip_number}`,
-      amount: record.net_salary,
-      expense_date: req.body.payment_date || new Date().toISOString().slice(0, 10),
-      payment_mode: req.body.payment_mode,
-      status: 'APPROVED',
-      recorded_by: req.user.id,
-      approved_by: req.user.id,
+      // Salary paid is an institutional expense.
+      await Expense.create([{
+        campus_id: oid(record.campus_id),
+        category: 'PAYROLL',
+        title: `Salary ${record.month}/${record.year} — ${record.payslip_number}`,
+        amount: record.net_salary,
+        expense_date: req.body.payment_date || new Date().toISOString().slice(0, 10),
+        payment_mode: req.body.payment_mode,
+        status: 'APPROVED',
+        recorded_by: oid(req.user.id),
+        approved_by: oid(req.user.id),
+      }], opts);
     });
 
     await notify({
@@ -788,7 +979,7 @@ payrollRouter.post(
       oldValues: { status: record.status },
       newValues: { status: 'PAID' },
     });
-    return ok(res, await get('SELECT * FROM payroll WHERE id = ?', [id]));
+    return ok(res, plain(await Payroll.findById(oid(id))));
   })
 );
 
@@ -797,27 +988,38 @@ payrollRouter.get(
   '/:id/payslip',
   requirePermission('payroll.view'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const record = await get(
-      `SELECT p.*, u.full_name, u.email, f.faculty_code, f.designation, f.bank_account, f.pan_number,
-              d.name AS department_name
-         FROM payroll p
-         JOIN users u ON u.id = p.user_id
-         LEFT JOIN faculty f ON f.user_id = u.id
-         LEFT JOIN departments d ON d.id = f.department_id
-        WHERE p.id = ?`,
-      [id]
-    );
-    if (!record) throw notFound('Payslip not found');
+    const id = req.params.id;
+    const payrollDoc = await Payroll.findById(oid(id)).populate('user_id', 'full_name email');
+    if (!payrollDoc) throw notFound('Payslip not found');
+
+    /*
+     * The staff details hang off the *account*, not off the payslip: a payslip
+     * names a user, and the faculty record is found from there. That is the
+     * direction the LEFT JOIN read it, and it is why somebody on payroll who
+     * is not teaching staff still gets a payslip.
+     */
+    const member = await Faculty.findOne({ user_id: payrollDoc.user_id?._id })
+      .select('faculty_code designation bank_account pan_number department_id')
+      .populate('department_id', 'name');
+
+    const record = {
+      ...lift(payrollDoc, { user_id: { full_name: 'full_name', email: 'email' } }),
+      faculty_code: member?.faculty_code ?? null,
+      designation: member?.designation ?? null,
+      bank_account: member?.bank_account ?? null,
+      pan_number: member?.pan_number ?? null,
+      department_name: member?.department_id?.name ?? null,
+    };
 
     const canManage = isAdmin(req.user) || req.permissions.has('payroll.manage') || req.permissions.has('payroll.edit');
-    if (!canManage && record.user_id !== req.user.id) throw forbidden('You may only view your own payslip');
+    if (!canManage && !sameId(record.user_id, req.user.id)) throw forbidden('You may only view your own payslip');
 
-    const structure = await get(
-      `SELECT * FROM salary_structures WHERE user_id = ? AND status = 'ACTIVE' ORDER BY effective_from DESC LIMIT 1`,
-      [record.user_id]
+    const structure = plain(
+      await SalaryStructure.findOne({ user_id: oid(record.user_id), status: 'ACTIVE' })
+        .sort({ effective_from: -1 })
     );
-    const campus = await get('SELECT name, address, city, phone, email FROM campuses WHERE id = ?', [record.campus_id]);
+    const campus = await Campus.findById(oid(record.campus_id))
+      .select('name address city phone email').lean();
     return ok(res, { payslip: record, structure, campus, amountInWords: amountInWords(record.net_salary) });
   })
 );
