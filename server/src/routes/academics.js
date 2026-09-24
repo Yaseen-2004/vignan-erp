@@ -1,6 +1,9 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { all, get, run, insert, scalar } from '../db/connection.js';
+import { AcademicYear, Attendance, Campus, Class, Course, CourseAssignment, Department, Examination, Faculty, FeeCategory, Grade, InventoryCategory, Parent, Route, Section, Student, StudentFee, StudentParent, Subject, Timetable, Vehicle } from '../db/mongo/models.js';
+import { oid, transaction } from '../db/mongo/connection.js';
+import { lift, plain } from '../db/mongo/query.js';
+import { sameId } from '../lib/scope.js';
 import { asyncHandler, ok, created } from '../lib/http.js';
 import { badRequest, notFound, forbidden } from '../lib/errors.js';
 import { requirePermission, requireRole } from '../middleware/auth.js';
@@ -20,8 +23,8 @@ const router = Router();
  */
 async function ownSectionFor(req) {
   if (isStudent(req.user)) {
-    const student = await get('SELECT section_id FROM students WHERE user_id = ?', [req.user.id]);
-    return student?.section_id ?? 0;
+    const student = await Student.findOne({ user_id: oid(req.user.id) }).select('section_id').lean();
+    return student?.section_id ?? null;
   }
   if (isParent(req.user)) {
     const children = await childrenOf(req.user);
@@ -42,8 +45,7 @@ router.use(
     table: 'campuses',
     module: 'campuses',
     entityType: 'Campus',
-    alias: 'c',
-    searchable: ['c.name', 'c.code', 'c.city'],
+    searchable: ['name', 'code', 'city'],
     filterable: ['status'],
     sortable: ['id', 'name', 'code'],
     required: ['code', 'name'],
@@ -57,10 +59,11 @@ const yearsRouter = createResourceRouter({
   table: 'academic_years',
   module: 'academics',
   entityType: 'Academic Year',
-  alias: 'ay',
-  select: `ay.*, (SELECT COUNT(*) FROM classes c WHERE c.academic_year_id = ay.id) AS class_count,
-           (SELECT COUNT(*) FROM enrollments e WHERE e.academic_year_id = ay.id) AS enrollment_count`,
-  searchable: ['ay.name'],
+  counts: {
+    class_count: { from: 'classes', on: 'academic_year_id' },
+    enrollment_count: { from: 'enrollments', on: 'academic_year_id' },
+  },
+  searchable: ['name'],
   filterable: ['status', 'is_current'],
   sortable: ['id', 'name', 'start_date'],
   required: ['name', 'start_date', 'end_date'],
@@ -72,13 +75,30 @@ yearsRouter.post(
   '/:id/set-current',
   requirePermission('academics.manage'),
   asyncHandler(async (req, res) => {
-    const id = Number(req.params.id);
-    const year = await get('SELECT * FROM academic_years WHERE id = ?', [id]);
+    const id = req.params.id;
+    const year = plain(await AcademicYear.findById(oid(id)));
     if (!year) throw notFound('Academic year not found');
-    if (!isAdmin(req.user) && year.campus_id !== req.user.campus_id) throw forbidden('Different campus');
+    if (!isAdmin(req.user) && !sameId(year.campus_id, req.user.campus_id)) throw forbidden('Different campus');
 
-    await run('UPDATE academic_years SET is_current = 0 WHERE campus_id = ?', [year.campus_id]);
-    await run("UPDATE academic_years SET is_current = 1, status = 'ACTIVE' WHERE id = ?", [id]);
+    /*
+     * Exactly one year is current per campus, so the two writes are one act.
+     * Between them no year is current at all, and anything that reads the
+     * current year in that moment — an enrolment, a timetable — would find
+     * none and refuse.
+     */
+    await transaction(async (session) => {
+      const opts = session ? { session } : {};
+      await AcademicYear.updateMany(
+        { campus_id: oid(year.campus_id) },
+        { $set: { is_current: 0 } },
+        opts
+      );
+      await AcademicYear.updateOne(
+        { _id: oid(id) },
+        { $set: { is_current: 1, status: 'ACTIVE' } },
+        opts
+      );
+    });
 
     await logActivity({
       req,
@@ -101,11 +121,13 @@ router.use(
     table: 'departments',
     module: 'departments',
     entityType: 'Department',
-    alias: 'd',
-    select: `d.*, u.full_name AS head_name,
-             (SELECT COUNT(*) FROM faculty f WHERE f.department_id = d.id) AS faculty_count`,
-    joins: `LEFT JOIN faculty hf ON hf.id = d.head_faculty_id LEFT JOIN users u ON u.id = hf.user_id`,
-    searchable: ['d.name', 'd.code'],
+    /*
+     * `head_faculty_id` is one of the four columns that hold an identifier
+     * without naming its collection, so it is text and cannot be populated.
+     * The head's name is resolved after the page is fetched.
+     */
+    counts: { faculty_count: { from: 'faculty', on: 'department_id' } },
+    searchable: ['name', 'code'],
     filterable: ['status'],
     sortable: ['id', 'name', 'code'],
     required: ['code', 'name'],
@@ -120,16 +142,17 @@ router.use(
     table: 'classes',
     module: 'academics',
     entityType: 'Class',
-    alias: 'c',
-    select: `c.*, ay.name AS academic_year_name, u.full_name AS class_teacher_name,
-             (SELECT COUNT(*) FROM sections s WHERE s.class_id = c.id) AS section_count,
-             (SELECT COUNT(*) FROM students st WHERE st.class_id = c.id AND st.status = 'ACTIVE') AS student_count`,
-    joins: `LEFT JOIN academic_years ay ON ay.id = c.academic_year_id
-            LEFT JOIN faculty f ON f.id = c.class_teacher_id
-            LEFT JOIN users u ON u.id = f.user_id`,
-    searchable: ['c.name', 'c.stream'],
+    populate: {
+      academic_year_id: { name: 'academic_year_name' },
+      'class_teacher_id.user_id': { full_name: 'class_teacher_name' },
+    },
+    counts: {
+      section_count: { from: 'sections', on: 'class_id' },
+      student_count: { from: 'students', on: 'class_id', where: { status: 'ACTIVE' } },
+    },
+    searchable: ['name', 'stream'],
     filterable: ['academic_year_id', 'status', 'board'],
-    boardColumn: 'c.board',
+    board: 'board',
     sortable: ['id', 'name', 'numeric_level'],
     required: ['name', 'academic_year_id'],
     defaultSort: 'numeric_level',
@@ -143,15 +166,17 @@ router.use(
     table: 'sections',
     module: 'academics',
     entityType: 'Section',
-    alias: 's',
-    select: `s.*, c.name AS class_name, c.board, c.academic_year_id, u.full_name AS section_teacher_name,
-             (SELECT COUNT(*) FROM students st WHERE st.section_id = s.id AND st.status = 'ACTIVE') AS student_count`,
-    joins: `JOIN classes c ON c.id = s.class_id
-            LEFT JOIN faculty f ON f.id = s.section_teacher_id
-            LEFT JOIN users u ON u.id = f.user_id`,
-    searchable: ['s.name', 'c.name'],
-    filterable: ['class_id', 'status', { param: 'board', column: 'c.board' }],
-    boardColumn: 'c.board',
+    populate: {
+      class_id: { name: 'class_name', board: 'board', academic_year_id: 'academic_year_id' },
+      'section_teacher_id.user_id': { full_name: 'section_teacher_name' },
+    },
+    counts: {
+      student_count: { from: 'students', on: 'section_id', where: { status: 'ACTIVE' } },
+    },
+    searchable: ['name'],
+    filterable: ['class_id', 'status'],
+    // A section's department is its class's.
+    board: { via: 'class_id', field: 'board' },
     sortable: ['id', 'name'],
     required: ['name', 'class_id'],
     defaultSort: 'name',
@@ -165,11 +190,9 @@ router.use(
     table: 'subjects',
     module: 'academics',
     entityType: 'Subject',
-    alias: 's',
-    select: `s.*, d.name AS department_name,
-             (SELECT COUNT(*) FROM courses co WHERE co.subject_id = s.id) AS course_count`,
-    joins: `LEFT JOIN departments d ON d.id = s.department_id`,
-    searchable: ['s.name', 's.code'],
+    populate: { department_id: { name: 'department_name' } },
+    counts: { course_count: { from: 'courses', on: 'subject_id' } },
+    searchable: ['name', 'code'],
     filterable: ['type', 'status', 'department_id'],
     sortable: ['id', 'name', 'code'],
     required: ['code', 'name'],
@@ -182,28 +205,30 @@ const coursesRouter = createResourceRouter({
   table: 'courses',
   module: 'courses',
   entityType: 'Course',
-  alias: 'co',
-  select: `co.*, sub.name AS subject_name, sub.code AS subject_code, c.name AS class_name, c.board,
-           ay.name AS academic_year_name,
-           (SELECT COUNT(*) FROM course_assignments ca WHERE ca.course_id = co.id AND ca.status = 'ACTIVE') AS assignment_count,
-           (SELECT COUNT(*) FROM course_materials cm WHERE cm.course_id = co.id) AS material_count`,
-  joins: `JOIN subjects sub ON sub.id = co.subject_id
-          JOIN classes c ON c.id = co.class_id
-          JOIN academic_years ay ON ay.id = co.academic_year_id`,
-  searchable: ['co.name', 'co.code', 'sub.name'],
-  filterable: ['class_id', 'subject_id', 'academic_year_id', 'status', { param: 'board', column: 'c.board' }],
-  boardColumn: 'c.board',
+  populate: {
+    subject_id: { name: 'subject_name', code: 'subject_code' },
+    class_id: { name: 'class_name', board: 'board' },
+    academic_year_id: { name: 'academic_year_name' },
+  },
+  counts: {
+    assignment_count: { from: 'course_assignments', on: 'course_id', where: { status: 'ACTIVE' } },
+    material_count: { from: 'course_materials', on: 'course_id' },
+  },
+  searchable: ['name', 'code'],
+  filterable: ['class_id', 'subject_id', 'academic_year_id', 'status'],
+  // A course's department is its class's.
+  board: { via: 'class_id', field: 'board' },
   sortable: ['id', 'name', 'code'],
   required: ['code', 'name', 'subject_id', 'class_id', 'academic_year_id'],
   defaultSort: 'name',
   // A teacher only ever sees the courses assigned to them.
-  scopeClause: async (req) => {
+  scopeFilter: async (req) => {
     if (!isTeacher(req.user)) return null;
     const facultyId = await facultyIdOf(req.user);
-    return {
-      clause: `co.id IN (SELECT course_id FROM course_assignments WHERE faculty_id = ? AND status = 'ACTIVE')`,
-      params: [facultyId ?? 0],
-    };
+    if (!facultyId) return { $expr: { $eq: [1, 0] } };
+    const assigned = await CourseAssignment.find({ faculty_id: oid(facultyId), status: 'ACTIVE' })
+      .select('course_id').lean();
+    return { _id: { $in: assigned.map((a) => a.course_id).filter(Boolean) } };
   },
 });
 
@@ -212,36 +237,36 @@ coursesRouter.get(
   '/:id/students',
   requirePermission('courses.view', 'students.view'),
   asyncHandler(async (req, res) => {
-    const courseId = Number(req.params.id);
-    const course = await get('SELECT * FROM courses WHERE id = ?', [courseId]);
+    const courseId = req.params.id;
+    const course = plain(await Course.findById(oid(courseId)));
     if (!course) throw notFound('Course not found');
 
-    const params = [course.class_id];
-    let sectionFilter = '';
+    const filter = { class_id: oid(course.class_id), status: 'ACTIVE' };
+
+    // A teacher sees the sections of this course they were actually given.
     if (isTeacher(req.user)) {
       const facultyId = await facultyIdOf(req.user);
-      const sections = (await all(
-        `SELECT section_id FROM course_assignments WHERE course_id = ? AND faculty_id = ? AND status = 'ACTIVE'`,
-        [courseId, facultyId ?? 0]
-      )).map((r) => r.section_id);
+      const assigned = await CourseAssignment.find({
+        course_id: oid(courseId),
+        faculty_id: oid(facultyId),
+        status: 'ACTIVE',
+      }).select('section_id').lean();
+      const sections = assigned.map((a) => a.section_id).filter(Boolean);
       if (!sections.length) throw forbidden('This course is not assigned to you');
-      sectionFilter = ` AND s.section_id IN (${sections.map(() => '?').join(',')})`;
-      params.push(...sections);
+      filter.section_id = { $in: sections };
     } else if (req.query.section_id) {
-      sectionFilter = ' AND s.section_id = ?';
-      params.push(req.query.section_id);
+      filter.section_id = oid(req.query.section_id);
     }
 
-    const students = await all(
-      `SELECT s.id, s.admission_number, s.roll_number, s.first_name, s.last_name, s.photo, s.status,
-              sec.name AS section_name, c.name AS class_name
-         FROM students s
-         LEFT JOIN sections sec ON sec.id = s.section_id
-         LEFT JOIN classes c ON c.id = s.class_id
-        WHERE s.class_id = ? AND s.status = 'ACTIVE'${sectionFilter}
-        ORDER BY s.roll_number, s.first_name`,
-      params
-    );
+    const students = lift(
+      await Student.find(filter)
+        .select('admission_number roll_number first_name last_name photo status section_id class_id')
+        .populate('section_id', 'name')
+        .populate('class_id', 'name'),
+      { section_id: { name: 'section_name' }, class_id: { name: 'class_name' } }
+    ).sort((a, b) => (Number(a.roll_number) || Infinity) - (Number(b.roll_number) || Infinity)
+      || String(a.first_name ?? '').localeCompare(String(b.first_name ?? '')));
+
     return ok(res, students);
   })
 );
@@ -252,30 +277,30 @@ const assignmentsRouter = createResourceRouter({
   table: 'course_assignments',
   module: 'courses',
   entityType: 'Course Assignment',
-  alias: 'ca',
-  select: `ca.*, co.name AS course_name, co.code AS course_code, sub.name AS subject_name,
-           u.full_name AS faculty_name, f.faculty_code, sec.name AS section_name, c.name AS class_name, c.board`,
-  joins: `JOIN courses co ON co.id = ca.course_id
-          JOIN subjects sub ON sub.id = co.subject_id
-          JOIN faculty f ON f.id = ca.faculty_id
-          JOIN users u ON u.id = f.user_id
-          JOIN sections sec ON sec.id = ca.section_id
-          JOIN classes c ON c.id = sec.class_id`,
-  searchable: ['co.name', 'u.full_name'],
-  filterable: ['course_id', 'faculty_id', 'section_id', 'academic_year_id', 'status', { param: 'board', column: 'c.board' }],
-  boardColumn: 'c.board',
+  populate: {
+    course_id: { name: 'course_name', code: 'course_code' },
+    'course_id.subject_id': { name: 'subject_name' },
+    faculty_id: { faculty_code: 'faculty_code' },
+    'faculty_id.user_id': { full_name: 'faculty_name' },
+    section_id: { name: 'section_name' },
+    'section_id.class_id': { name: 'class_name', board: 'board' },
+  },
+  searchable: [],
+  filterable: ['course_id', 'faculty_id', 'section_id', 'academic_year_id', 'status'],
+  // An assignment's department is its section's class's.
+  board: { via: 'section_id', field: 'board' },
   sortable: ['id'],
   required: ['course_id', 'faculty_id', 'section_id', 'academic_year_id'],
   permissions: { create: 'courses.manage', edit: 'courses.manage', delete: 'courses.manage' },
   beforeCreate: async (data, req) => {
-    const faculty = await get('SELECT * FROM faculty WHERE id = ?', [data.faculty_id]);
+    const faculty = await Faculty.findById(oid(data.faculty_id)).select('staff_type').lean();
     if (!faculty) throw badRequest('Unknown faculty member');
     if (faculty.staff_type !== 'TEACHING') throw badRequest('Only teaching staff can be assigned to a course');
     data.assigned_by = req.user.id;
     return data;
   },
   afterCreate: async (row) => {
-    const faculty = await get('SELECT user_id, campus_id FROM faculty WHERE id = ?', [row.faculty_id]);
+    const faculty = await Faculty.findById(oid(row.faculty_id)).select('user_id campus_id').lean();
     if (faculty) {
       await notify({
         userId: faculty.user_id,
@@ -350,13 +375,19 @@ const timetableRouter = createResourceRouter({
 
     // A teacher cannot be in two rooms during the same period.
     if (data.faculty_id) {
-      const clash = await get(
-        `SELECT t.id, c.name AS class_name, sec.name AS section_name FROM timetables t
-           JOIN classes c ON c.id = t.class_id JOIN sections sec ON sec.id = t.section_id
-          WHERE t.faculty_id = ? AND t.day_of_week = ? AND t.period = ? AND t.academic_year_id = ?`,
-        [data.faculty_id, data.day_of_week, data.period, data.academic_year_id]
-      );
-      if (clash) throw badRequest(`That teacher already has ${clash.class_name} ${clash.section_name} in this period`);
+      const clash = await Timetable.findOne({
+        faculty_id: oid(data.faculty_id),
+        day_of_week: data.day_of_week,
+        period: data.period,
+        academic_year_id: oid(data.academic_year_id),
+      })
+        .populate('class_id', 'name')
+        .populate('section_id', 'name');
+      if (clash) {
+        throw badRequest(
+          `That teacher already has ${clash.class_id?.name ?? ''} ${clash.section_id?.name ?? ''} in this period`
+        );
+      }
     }
     return data;
   },
@@ -378,7 +409,7 @@ async function announceTimetable(row) {
 
   // The teacher standing in front of the class.
   if (row.faculty_id) {
-    const teacher = await get('SELECT user_id, campus_id FROM faculty WHERE id = ?', [row.faculty_id]);
+    const teacher = await Faculty.findById(oid(row.faculty_id)).select('user_id campus_id').lean();
     if (teacher?.user_id) {
       await notify({
         userId: teacher.user_id,
@@ -394,10 +425,9 @@ async function announceTimetable(row) {
   }
 
   // The pupils who sit in it, and the parents who plan around it.
-  const students = await all(
-    `SELECT s.id, s.user_id, s.campus_id FROM students s
-      WHERE s.section_id = ? AND s.status = 'ACTIVE'`,
-    [row.section_id]
+  const students = plain(
+    await Student.find({ section_id: oid(row.section_id), status: 'ACTIVE' })
+      .select('user_id campus_id')
   );
   if (!students.length) return;
 
@@ -417,13 +447,20 @@ async function announceTimetable(row) {
     }
   }
 
-  const parents = await all(
-    `SELECT DISTINCT p.user_id, p.campus_id
-       FROM student_parents sp
-       JOIN parents p ON p.id = sp.parent_id
-      WHERE sp.student_id IN (${students.map(() => '?').join(',')}) AND p.user_id IS NOT NULL`,
-    students.map((student) => student.id)
-  );
+  // DISTINCT mattered: a parent with two children in the section is told once.
+  const links = await StudentParent.find({ student_id: { $in: students.map((x) => oid(x.id)) } })
+    .select('parent_id').lean();
+  const families = links.length
+    ? await Parent.find({ _id: { $in: links.map((l) => l.parent_id) }, user_id: { $ne: null } })
+      .select('user_id campus_id').lean()
+    : [];
+  const seen = new Set();
+  const parents = families.filter((f) => {
+    const key = String(f.user_id);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
   for (const parent of parents) {
     await notify({
       userId: parent.user_id,
@@ -443,65 +480,49 @@ timetableRouter.get(
   '/grid',
   requirePermission('timetable.view'),
   asyncHandler(async (req, res) => {
-    const clauses = [];
-    const params = [];
+    const filter = {};
 
-    // Students and parents are pinned to their own (or their child's) section.
-    const ownSection = await ownSectionFor(req);
-    if (ownSection !== null) {
-      clauses.push('t.section_id = ?');
-      params.push(ownSection);
+    if (req.query.section_id) {
+      filter.section_id = oid(req.query.section_id);
+    } else if (req.query.faculty_id) {
+      filter.faculty_id = oid(req.query.faculty_id);
+    } else if (isTeacher(req.user)) {
+      filter.faculty_id = oid(await facultyIdOf(req.user));
     } else {
-      if (req.query.section_id) {
-        clauses.push('t.section_id = ?');
-        params.push(req.query.section_id);
-      }
-      if (req.query.faculty_id) {
-        clauses.push('t.faculty_id = ?');
-        params.push(req.query.faculty_id);
-      }
-      // A teacher without an explicit filter sees their own timetable.
-      if (!clauses.length && isTeacher(req.user)) {
-        clauses.push('t.faculty_id = ?');
-        params.push(await facultyIdOf(req.user) ?? 0);
-      }
-      if (!clauses.length) throw badRequest('Provide section_id or faculty_id');
+      const own = await ownSectionFor(req);
+      if (own) filter.section_id = oid(own);
+      else throw badRequest('Provide section_id or faculty_id');
     }
-    if (!isAdmin(req.user) && req.user.campus_id) {
-      clauses.push('t.campus_id = ?');
-      params.push(req.user.campus_id);
-    }
-    // A section or teacher id is easy to guess, so the department is enforced
-    // here too rather than trusted from the caller.
+
+    if (!isAdmin(req.user) && req.user.campus_id) filter.campus_id = oid(req.user.campus_id);
+
+    /*
+     * A section or teacher id is easy to guess, so the department is enforced
+     * here rather than trusted from the caller. It lives on the class, so the
+     * classes of that wing are resolved and the slots narrowed to them.
+     */
     const wing = await boardOf(req.user);
     if (wing) {
-      clauses.push('c.board = ?');
-      params.push(wing);
+      const classes = await Class.find({ board: wing }).select('_id').lean();
+      filter.class_id = { $in: classes.map((c) => c._id) };
     }
 
-    const rows = await all(
-      `SELECT t.*, co.name AS course_name, sub.name AS subject_name, u.full_name AS faculty_name,
-              c.name AS class_name, sec.name AS section_name
-         FROM timetables t
-         LEFT JOIN courses co ON co.id = t.course_id
-         LEFT JOIN subjects sub ON sub.id = co.subject_id
-         LEFT JOIN faculty f ON f.id = t.faculty_id
-         LEFT JOIN users u ON u.id = f.user_id
-         LEFT JOIN classes c ON c.id = t.class_id
-         LEFT JOIN sections sec ON sec.id = t.section_id
-        WHERE ${clauses.join(' AND ')}
-        ORDER BY t.day_of_week, t.period`,
-      params
+    const rows = lift(
+      await Timetable.find(filter)
+        .populate({ path: 'course_id', select: 'name subject_id', populate: { path: 'subject_id', select: 'name' } })
+        .populate({ path: 'faculty_id', select: 'user_id', populate: { path: 'user_id', select: 'full_name' } })
+        .populate('class_id', 'name')
+        .populate('section_id', 'name')
+        .sort({ day_of_week: 1, period: 1 }),
+      {
+        course_id: { name: 'course_name' },
+        'course_id.subject_id': { name: 'subject_name' },
+        'faculty_id.user_id': { full_name: 'faculty_name' },
+        class_id: { name: 'class_name' },
+        section_id: { name: 'section_name' },
+      }
     );
 
-    const days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'];
-    const grid = days.map((name, index) => ({
-      day: index + 1,
-      name,
-      slots: rows.filter((r) => r.day_of_week === index + 1),
-    }));
-    const periods = [...new Set(rows.map((r) => r.period))].sort((a, b) => a - b);
-    return ok(res, { grid, periods, slots: rows });
   })
 );
 router.use('/timetable', timetableRouter);
@@ -530,114 +551,33 @@ router.get(
   '/departments/overview',
   requirePermission('academics.view', 'students.view'),
   asyncHandler(async (req, res) => {
-    const campusId = isAdmin(req.user) && req.query.campus_id ? Number(req.query.campus_id) : req.user.campus_id;
-    const scope = campusId ? ' AND campus_id = ?' : '';
-    const p = campusId ? [campusId] : [];
+    const campusId = isAdmin(req.user) && req.query.campus_id ? req.query.campus_id : req.user.campus_id;
+    const scope = campusId ? { campus_id: oid(campusId) } : {};
 
-    const boards = [
-      { board: 'STATE', label: 'State Board', description: 'Karnataka State syllabus · Kannada first language' },
-      { board: 'CBSE', label: 'CBSE', description: 'National curriculum · Hindi first language' },
-    ];
-
-    // A restricted Administrator sees only their own wing here.
-    const confinedTo = await boardOf(req.user);
-    const overview = await Promise.all(boards
-      .filter((entry) => !confinedTo || entry.board === confinedTo)
-      .map(async (entry) => {
-      const params = [entry.board, ...p];
-
-      const students = Number(
-        await scalar(`SELECT COUNT(*) AS n FROM students WHERE board = ? AND status = 'ACTIVE'${scope}`, params) || 0
-      );
-      const classes = Number(
-        await scalar(`SELECT COUNT(*) AS n FROM classes WHERE board = ? AND status = 'ACTIVE'${scope}`, params) || 0
-      );
-      const sections = Number(
-        await scalar(
-          `SELECT COUNT(*) AS n FROM sections sec JOIN classes c ON c.id = sec.class_id
-            WHERE c.board = ? AND sec.status = 'ACTIVE'${scope ? ' AND sec.campus_id = ?' : ''}`,
-          params
-        ) || 0
-      );
-      const courses = Number(
-        await scalar(
-          `SELECT COUNT(*) AS n FROM courses co JOIN classes c ON c.id = co.class_id
-            WHERE c.board = ? AND co.status = 'ACTIVE'${scope ? ' AND co.campus_id = ?' : ''}`,
-          params
-        ) || 0
-      );
-      const teachers = Number(
-        await scalar(
-          `SELECT COUNT(*) AS n FROM faculty
-            WHERE staff_type = 'TEACHING' AND status = 'ACTIVE'
-              AND (board = ? OR board = 'BOTH')${scope}`,
-          params
-        ) || 0
-      );
-
-      const attendance = await get(
-        `SELECT COUNT(*) AS total, SUM(CASE WHEN a.status = 'PRESENT' THEN 1 ELSE 0 END) AS present
-           FROM attendance a JOIN students s ON s.id = a.student_id
-          WHERE s.board = ? AND substr(a.attendance_date, 1, 10) >= to_char((now() AT TIME ZONE 'UTC') + interval '-30 days', 'YYYY-MM-DD')
-            ${scope ? ' AND a.campus_id = ?' : ''}`,
-        params
-      );
-
-      const fees = await get(
-        `SELECT COALESCE(SUM(sf.total_amount - sf.discount_amount), 0) AS billed,
-                COALESCE(SUM(sf.paid_amount), 0) AS collected,
-                COALESCE(SUM(sf.total_amount - sf.discount_amount - sf.paid_amount), 0) AS pending
-           FROM student_fees sf JOIN students s ON s.id = sf.student_id
-          WHERE s.board = ?${scope ? ' AND sf.campus_id = ?' : ''}`,
-        params
-      );
-
-      const classList = await all(
-        `SELECT c.id, c.name, c.numeric_level,
-                (SELECT COUNT(*) FROM students st WHERE st.class_id = c.id AND st.status = 'ACTIVE') AS students
-           FROM classes c
-          WHERE c.board = ? AND c.status = 'ACTIVE'${scope ? ' AND c.campus_id = ?' : ''}
-          ORDER BY c.numeric_level`,
-        params
-      );
-
-      return {
-        ...entry,
-        students,
-        classes,
-        sections,
-        courses,
-        teachers,
-        attendancePercent: attendance?.total
-          ? Number(((attendance.present / attendance.total) * 100).toFixed(1))
-          : null,
-        fees,
-        classList,
-      };
-    }));
-
-    return ok(res, overview);
-  })
-);
-
-/**
- * Lookup bundle for form dropdowns — one round trip instead of eight.
- *
- * These lists fill every select in the app, so they honour the department the
- * user is assigned to: offering a class they cannot open would only produce a
- * refusal one click later.
- */
-router.get(
-  '/lookups',
-  asyncHandler(async (req, res) => {
-    const campusId = isAdmin(req.user) && req.query.campus_id ? Number(req.query.campus_id) : req.user.campus_id;
-    const scope = campusId ? ' WHERE campus_id = ?' : '';
-    const params = campusId ? [campusId] : [];
-
-    // Appends ` AND c.board = ?` (or ` WHERE ...`) when the user is confined.
+    /*
+     * These lists fill every select in the portal, so they honour the
+     * department the person is assigned to: offering a class they cannot open
+     * would only produce a refusal one click later.
+     *
+     * Where the department lives on the class rather than on the record —
+     * sections, courses — the classes of that wing are resolved once and the
+     * rest narrowed to them.
+     */
     const wing = await boardOf(req.user);
-    const confine = (column, alreadyFiltered) =>
-      wing ? `${alreadyFiltered ? ' AND' : ' WHERE'} ${column} = '${wing}'` : '';
+    const wingClasses = wing
+      ? await Class.find({ ...scope, board: wing }).select('_id').lean()
+      : null;
+    const withinWing = wingClasses ? { class_id: { $in: wingClasses.map((c) => c._id) } } : {};
+
+    const rows = (docs) => plain(docs);
+
+    const staffOfType = async (filter) => {
+      const docs = await Faculty.find({ ...scope, ...filter, status: 'ACTIVE' })
+        .select('faculty_code user_id')
+        .populate('user_id', 'full_name');
+      return lift(docs, { user_id: { full_name: 'full_name' } })
+        .sort((a, b) => String(a.full_name ?? '').localeCompare(String(b.full_name ?? '')));
+    };
 
     return ok(res, {
       // How many periods each weekday runs; 0 means the school is closed.
@@ -648,54 +588,58 @@ router.get(
         { value: 'STATE', label: 'State Board' },
         { value: 'CBSE', label: 'CBSE' },
       ],
-      campuses: await all('SELECT id, code, name FROM campuses ORDER BY name'),
-      academicYears: await all(`SELECT id, name, is_current, status FROM academic_years${scope} ORDER BY start_date DESC`, params),
-      classes: await all(
-        `SELECT c.id, c.name, c.academic_year_id, c.numeric_level, c.board FROM classes c
-          ${campusId ? 'WHERE c.campus_id = ?' : ''}${confine('c.board', !!campusId)}
-          ORDER BY c.board, c.numeric_level, c.name`,
-        params
+
+      campuses: rows(await Campus.find({}).select('code name').sort({ name: 1 })),
+
+      academicYears: rows(
+        await AcademicYear.find(scope).select('name is_current status').sort({ start_date: -1 })
       ),
-      sections: await all(
-        `SELECT s.id, s.name, s.class_id, c.name AS class_name, c.board FROM sections s
-           JOIN classes c ON c.id = s.class_id ${campusId ? 'WHERE s.campus_id = ?' : ''}${confine('c.board', !!campusId)}
-          ORDER BY c.board, c.name, s.name`,
-        params
+
+      classes: rows(
+        await Class.find({ ...scope, ...(wing ? { board: wing } : {}) })
+          .select('name academic_year_id numeric_level board')
+          .sort({ board: 1, numeric_level: 1, name: 1 })
       ),
-      subjects: await all(`SELECT id, code, name, type FROM subjects${scope} ORDER BY name`, params),
-      courses: await all(
-        `SELECT co.id, co.code, co.name, co.class_id, co.subject_id, c.board FROM courses co
-           JOIN classes c ON c.id = co.class_id
-          ${campusId ? 'WHERE co.campus_id = ?' : ''}${confine('c.board', !!campusId)} ORDER BY co.name`,
-        params
+
+      sections: lift(
+        await Section.find({ ...scope, ...withinWing })
+          .select('name class_id')
+          .populate('class_id', 'name board')
+          .sort({ name: 1 }),
+        { class_id: { name: 'class_name', board: 'board' } }
+      ).sort((a, b) => String(a.board ?? '').localeCompare(String(b.board ?? ''))
+        || String(a.class_name ?? '').localeCompare(String(b.class_name ?? ''))
+        || String(a.name ?? '').localeCompare(String(b.name ?? ''))),
+
+      subjects: rows(await Subject.find(scope).select('code name type').sort({ name: 1 })),
+
+      courses: lift(
+        await Course.find({ ...scope, ...withinWing })
+          .select('code name class_id subject_id')
+          .populate('class_id', 'board')
+          .sort({ name: 1 }),
+        { class_id: { board: 'board' } }
       ),
-      departments: await all(`SELECT id, code, name FROM departments${scope} ORDER BY name`, params),
-      teachingStaff: await all(
-        `SELECT f.id, f.faculty_code, u.full_name FROM faculty f JOIN users u ON u.id = f.user_id
-          WHERE f.staff_type = 'TEACHING' AND f.status = 'ACTIVE'${campusId ? ' AND f.campus_id = ?' : ''}
-          ORDER BY u.full_name`,
-        params
+
+      departments: rows(await Department.find(scope).select('code name').sort({ name: 1 })),
+      teachingStaff: await staffOfType({ staff_type: 'TEACHING' }),
+      financialStaff: await staffOfType({ staff_type: 'FINANCIAL' }),
+      mentors: await staffOfType({ is_mentor: 1 }),
+
+      feeCategories: rows(await FeeCategory.find(scope).select('code name').sort({ name: 1 })),
+      examinations: rows(
+        await Examination.find(scope).select('name exam_type status').sort({ start_date: -1 })
       ),
-      financialStaff: await all(
-        `SELECT f.id, f.faculty_code, u.full_name FROM faculty f JOIN users u ON u.id = f.user_id
-          WHERE f.staff_type = 'FINANCIAL' AND f.status = 'ACTIVE'${campusId ? ' AND f.campus_id = ?' : ''}
-          ORDER BY u.full_name`,
-        params
+      routes: rows(await Route.find(scope).select('route_code name fare').sort({ name: 1 })),
+      vehicles: rows(
+        await Vehicle.find(scope).select('vehicle_number vehicle_type capacity').sort({ vehicle_number: 1 })
       ),
-      mentors: await all(
-        `SELECT f.id, f.faculty_code, u.full_name FROM faculty f JOIN users u ON u.id = f.user_id
-          WHERE f.is_mentor = 1 AND f.status = 'ACTIVE'${campusId ? ' AND f.campus_id = ?' : ''} ORDER BY u.full_name`,
-        params
+      grades: rows(
+        await Grade.find(scope).select('code min_percent max_percent grade_point').sort({ min_percent: -1 })
       ),
-      feeCategories: await all(`SELECT id, code, name FROM fee_categories${scope} ORDER BY name`, params),
-      examinations: await all(
-        `SELECT id, name, exam_type, status FROM examinations${scope} ORDER BY start_date DESC`,
-        params
+      inventoryCategories: rows(
+        await InventoryCategory.find(scope).select('code name').sort({ name: 1 })
       ),
-      routes: await all(`SELECT id, route_code, name, fare FROM routes${scope} ORDER BY name`, params),
-      vehicles: await all(`SELECT id, vehicle_number, vehicle_type, capacity FROM vehicles${scope} ORDER BY vehicle_number`, params),
-      grades: await all(`SELECT id, code, min_percent, max_percent, grade_point FROM grades${scope} ORDER BY min_percent DESC`, params),
-      inventoryCategories: await all(`SELECT id, code, name FROM inventory_categories${scope} ORDER BY name`, params),
     });
   })
 );
